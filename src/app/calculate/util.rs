@@ -145,7 +145,8 @@ impl GenerationSettings {
             proximity_importance: 13, // 20
             algorithm: Algorithm::Genetic,
             id,
-            sidelen: 128,
+            // Browser-friendly default. Users can still raise this in advanced settings.
+            sidelen: 64,
             custom_target: None,
             target_crop_scale: CropScale::identity(),
             source_crop_scale: CropScale::identity(),

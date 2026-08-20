@@ -347,7 +347,9 @@ impl Pixel {
     }
 }
 
-const SWAPS_PER_GENERATION_PER_PIXEL: usize = 128;
+// Keep interactive web jobs practical. The old value made a 128px job attempt
+// more than two million swaps before it could report its first progress update.
+const SWAPS_PER_GENERATION_PER_PIXEL: usize = 32;
 
 pub fn process_genetic<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
@@ -463,10 +465,10 @@ pub fn process_genetic<S: ProgressSink>(
             data,
         });
         tx.send(ProgressMsg::Progress(
-            1.0 - max_dist as f32 / settings.sidelen as f32,
+            (1.0 - max_dist as f32 / settings.sidelen as f32).max(0.01),
         ));
 
-        max_dist = (max_dist as f32 * 0.99).max(2.0) as u32;
+        max_dist = (max_dist as f32 * 0.95).max(2.0) as u32;
     }
 }
 

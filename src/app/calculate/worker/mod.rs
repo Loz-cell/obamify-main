@@ -47,6 +47,9 @@ pub fn worker_entry() {
                     let _ = global2.post_message(&serde_wasm_bindgen::to_value(&msg).unwrap());
                 };
 
+                // Confirm immediately that the worker received and decoded the job.
+                sink(ProgressMsg::Progress(0.01));
+
                 // If you need to yield, you can insert tiny awaits between steps.
                 // Here we just call the portable sync fn:
                 if let Err(e) = process(source, settings, &mut sink) {
