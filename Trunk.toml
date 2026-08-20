@@ -1,2 +1,4 @@
 [build]
-filehash = true
+# The module worker loads obamify.js by name. Stable filenames keep that
+# worker path valid on GitHub Pages and other subdirectory deployments.
+filehash = false

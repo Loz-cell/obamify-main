@@ -836,6 +836,13 @@ impl ObamifyApp {
             return;
         }
 
+        fn find_bundled_script(text: &str) -> Option<String> {
+            let start = text.find("obamify-")?;
+            let rest = &text[start..];
+            let end = rest.find(".js")?;
+            Some(format!("./{}", &rest[..end + 3]))
+        }
+
         let worker = {
             let wasm_script_src = js_sys::Reflect::get(
                 &js_sys::global(),
@@ -845,17 +852,31 @@ impl ObamifyApp {
             .and_then(|v| v.as_string())
             .and_then(|url| url.rsplit('/').next().map(|s| format!("./{}", s)))
             .unwrap_or_else(|| {
+                // Trunk emits an inline module script containing the hashed bundle name.
+                // Read that script directly; relying on a JavaScript stack trace is not
+                // reliable in optimized GitHub Pages builds.
+                if let Some(document) = web_sys::window().and_then(|w| w.document()) {
+                    let scripts = document.scripts();
+                    for index in 0..scripts.length() {
+                        if let Some(element) = scripts.item(index) {
+                            if let Ok(script) = element.dyn_into::<web_sys::HtmlScriptElement>() {
+                                if let Some(found) = find_bundled_script(&script.src()) {
+                                    return found;
+                                }
+                                if let Some(found) = find_bundled_script(&script.text()) {
+                                    return found;
+                                }
+                            }
+                        }
+                    }
+                }
+
                 // Fallback: parse from Error stack trace to find obamify-{hash}.js
                 let error = js_sys::Error::new("stack trace");
                 if let Ok(stack_val) = js_sys::Reflect::get(&error, &JsValue::from_str("stack")) {
                     if let Some(stack) = stack_val.as_string() {
-                        // Look for obamify-{hash}.js in the stack
-                        if let Some(start) = stack.find("obamify-") {
-                            let rest = &stack[start..];
-                            if let Some(end) = rest.find(".js") {
-                                let filename = &rest[..end + 3];
-                                return format!("./{}", filename);
-                            }
+                        if let Some(found) = find_bundled_script(&stack) {
+                            return found;
                         }
                     }
                 }
@@ -871,7 +892,22 @@ impl ObamifyApp {
             let w = Worker::new_with_options(&worker_url, &opts).expect("worker");
 
             // ---- onerror: may be ErrorEvent OR a generic Event/JsValue ----
+            let inbox_ptr: *mut Vec<ProgressMsg> = &mut self.inbox;
             let onerror = Closure::wrap(Box::new(move |e: JsValue| {
+                let message = if let Some(err) = e.dyn_ref::<web_sys::ErrorEvent>() {
+                    err.message()
+                } else if let Some(ev) = e.dyn_ref::<web_sys::Event>() {
+                    format!("worker event: {}", ev.type_())
+                } else {
+                    "unknown worker initialization error".to_owned()
+                };
+
+                unsafe {
+                    (*inbox_ptr).push(ProgressMsg::Error(format!(
+                        "Background processor failed to start: {message}"
+                    )));
+                }
+
                 if let Some(err) = e.dyn_ref::<web_sys::ErrorEvent>() {
                     // Safe: has .message()
                     web_sys::console::error_2(&"worker error:".into(), &err.message().into());
