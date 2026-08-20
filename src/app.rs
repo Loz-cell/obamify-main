@@ -863,8 +863,10 @@ impl ObamifyApp {
                                 if let Some(found) = find_bundled_script(&script.src()) {
                                     return found;
                                 }
-                                if let Some(found) = find_bundled_script(&script.text()) {
-                                    return found;
+                                if let Ok(text) = script.text() {
+                                    if let Some(found) = find_bundled_script(&text) {
+                                        return found;
+                                    }
                                 }
                             }
                         }
