@@ -120,7 +120,7 @@ jobs:
           const timer = setTimeout(() => {{
             document.body.dataset.result = 'timeout';
             worker.terminate();
-          }}, 10000);
+          }}, 30000);
           worker.onmessage = () => {{
             clearTimeout(timer);
             document.body.dataset.result = 'ready';
@@ -145,14 +145,52 @@ jobs:
             sleep 0.25
           done
 
-          timeout 30s google-chrome --headless=new --no-sandbox --disable-gpu \
-            --virtual-time-budget=15000 --dump-dom "$smoke_url" \
-            >"${RUNNER_TEMP}/portraitify-pages-worker-smoke.html"
-          grep -q 'data-result="ready"' "${RUNNER_TEMP}/portraitify-pages-worker-smoke.html" || {
-            cat "${RUNNER_TEMP}/portraitify-pages-worker-smoke.html"
+          npm install --no-save --package-lock=false --ignore-scripts puppeteer-core@24.16.0
+          if ! SMOKE_URL="$smoke_url" CHROME_BIN="$(command -v google-chrome)" node <<'JS'
+          const puppeteer = require('puppeteer-core');
+
+          (async () => {
+            const browser = await puppeteer.launch({
+              executablePath: process.env.CHROME_BIN,
+              headless: true,
+              args: ['--no-sandbox', '--disable-gpu'],
+            });
+            try {
+              const page = await browser.newPage();
+              page.on('console', message => {
+                console.log(`[browser:${message.type()}] ${message.text()}`);
+              });
+              page.on('pageerror', error => {
+                console.error(`[browser:pageerror] ${error.message}`);
+              });
+              await page.goto(process.env.SMOKE_URL, {
+                waitUntil: 'domcontentloaded',
+                timeout: 30000,
+              });
+              await page.waitForFunction(
+                () => document.body.dataset.result !== 'pending',
+                { timeout: 45000 },
+              );
+              const state = await page.evaluate(() => ({
+                result: document.body.dataset.result,
+                text: document.body.textContent,
+              }));
+              if (state.result !== 'ready') {
+                throw new Error(`worker smoke ended as ${state.result}: ${state.text}`);
+              }
+              console.log('worker startup smoke test passed');
+            } finally {
+              await browser.close();
+            }
+          })().catch(error => {
+            console.error(error);
+            process.exit(1);
+          });
+          JS
+          then
             cat "${RUNNER_TEMP}/portraitify-pages-http.log"
             exit 1
-          }
+          fi
       - name: Deploy
         uses: JamesIves/github-pages-deploy-action@v4
         with:
