@@ -39,18 +39,19 @@ fn heuristic(
     color * color_weight + (spatial * spatial_weight).pow(2)
 }
 
-struct ImgDiffWeights<'a> {
+struct ImgDiffWeights {
     source: Vec<(u8, u8, u8)>,
     target: Vec<(u8, u8, u8)>,
     weights: Vec<i64>,
     sidelen: usize,
-    settings: &'a GenerationSettings,
+    spatial_weight: i64,
+    negated: bool,
 }
 
 // const TARGET_IMAGE_PATH: &str = "./target.png";
 // const TARGET_WEIGHTS_PATH: &str = "./weights.png";
 
-impl Weights<i64> for ImgDiffWeights<'_> {
+impl Weights<i64> for ImgDiffWeights {
     fn rows(&self) -> usize {
         self.target.len()
     }
@@ -66,18 +67,26 @@ impl Weights<i64> for ImgDiffWeights<'_> {
         let (r1, g1, b1) = self.target[row];
         let (r2, g2, b2) = self.source[col];
         let weight = self.weights[row];
-        -heuristic(
+        let value = -heuristic(
             (x1 as u16, y1 as u16),
             (x2 as u16, y2 as u16),
             (r1, g1, b1),
             (r2, g2, b2),
             weight,
-            self.settings.proximity_importance,
-        )
+            self.spatial_weight,
+        );
+        if self.negated { -value } else { value }
     }
 
     fn neg(&self) -> Self {
-        todo!()
+        Self {
+            source: self.source.clone(),
+            target: self.target.clone(),
+            weights: self.weights.clone(),
+            sidelen: self.sidelen,
+            spatial_weight: self.spatial_weight,
+            negated: !self.negated,
+        }
     }
 }
 
@@ -110,18 +119,40 @@ impl ProgressMsg {
 
 type FxIndexSet<K> = indexmap::IndexSet<K, std::hash::BuildHasherDefault<AHasher>>;
 
+// Exact assignment grows cubically with the number of pixels (O(side^6)).
+// Above this limit the UI must use the bounded genetic matcher instead.
+pub const MAX_OPTIMAL_SIDELEN: u32 = 32;
+
+#[cfg(not(target_arch = "wasm32"))]
+#[inline]
+fn is_cancelled(cancel: &AtomicBool) -> bool {
+    cancel.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn process_optimal<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
     settings: GenerationSettings,
     tx: &mut S,
     #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source_img = image::ImageBuffer::from_vec(
+    util::validate_sidelen(settings.sidelen)?;
+    if settings.sidelen > MAX_OPTIMAL_SIDELEN {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "High quality supports resolutions up to {MAX_OPTIMAL_SIDELEN}px; choose Fast for {}px",
+                settings.sidelen
+            ),
+        )
+        .into());
+    }
+    tx.send(ProgressMsg::Progress(0.001));
+
+    let source_img = util::rgb_image_from_raw(
         unprocessed.width,
         unprocessed.height,
         unprocessed.source_img.clone(),
-    )
-    .unwrap();
+    )?;
     // let start_time = std::time::Instant::now();
     let (source_pixels, target_pixels, weights) = util::get_images(source_img, &settings)?;
 
@@ -130,7 +161,11 @@ pub fn process_optimal<S: ProgressSink>(
         target: target_pixels,
         weights,
         sidelen: settings.sidelen as usize,
-        settings: &settings,
+        spatial_weight: util::normalized_proximity_importance(
+            settings.proximity_importance,
+            settings.sidelen,
+        ),
+        negated: false,
     };
 
     // pathfinding::kuhn_munkres, inlined to allow for progress bar and cancelling
@@ -148,9 +183,21 @@ pub fn process_optimal<S: ProgressSink>(
         // lx is the labelling for x nodes, ly the labelling for y nodes. We start
         // with an acceptable labelling with the maximum possible values for lx
         // and 0 for ly.
-        let mut lx: Vec<i64> = (0..nx)
-            .map(|row| (0..ny).map(|col| weights.at(row, col)).max().unwrap())
-            .collect::<Vec<_>>();
+        let mut lx: Vec<i64> = Vec::with_capacity(nx);
+        let init_report_every = (nx / 50).max(1);
+        for row in 0..nx {
+            #[cfg(not(target_arch = "wasm32"))]
+            if is_cancelled(&cancel) {
+                tx.send(ProgressMsg::Cancelled);
+                return Ok(());
+            }
+            lx.push((0..ny).map(|col| weights.at(row, col)).max().unwrap());
+            if row % init_report_every == 0 {
+                tx.send(ProgressMsg::Progress(
+                    0.001 + 0.099 * (row + 1) as f32 / nx as f32,
+                ));
+            }
+        }
         let mut ly: Vec<i64> = vec![0; ny];
         // s, augmenting, and slack will be reset every time they are reused. augmenting
         // contains Some(prev) when the corresponding node belongs to the augmenting path.
@@ -158,7 +205,13 @@ pub fn process_optimal<S: ProgressSink>(
         let mut alternating = Vec::with_capacity(ny);
         let mut slack = vec![0; ny];
         let mut slackx = Vec::with_capacity(ny);
+        let match_report_every = (nx / 100).max(1);
         for root in 0..nx {
+            #[cfg(not(target_arch = "wasm32"))]
+            if is_cancelled(&cancel) {
+                tx.send(ProgressMsg::Cancelled);
+                return Ok(());
+            }
             alternating.clear();
             alternating.resize(ny, None);
             // Find y such that the path is augmented. This will be set when breaking for the
@@ -176,6 +229,11 @@ pub fn process_optimal<S: ProgressSink>(
                 slackx.clear();
                 slackx.resize(ny, root);
                 Some(loop {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if is_cancelled(&cancel) {
+                        tx.send(ProgressMsg::Cancelled);
+                        return Ok(());
+                    }
                     let mut delta = pathfinding::num_traits::Bounded::max_value();
                     let mut x = 0;
                     let mut y = 0;
@@ -236,17 +294,11 @@ pub fn process_optimal<S: ProgressSink>(
                 xy[x] = y;
                 y = prec;
             }
-            if root % 100 == 0 {
+            if root % match_report_every == 0 || root + 1 == nx {
                 // send progress
-                #[cfg(not(target_arch = "wasm32"))]
-                {
-                    if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                        tx.send(ProgressMsg::Cancelled);
-                        return Ok(());
-                    }
-                }
-
-                tx.send(ProgressMsg::Progress(root as f32 / nx as f32));
+                tx.send(ProgressMsg::Progress(
+                    0.1 + 0.899 * (root + 1) as f32 / nx as f32,
+                ));
 
                 let data = make_new_img(
                     &source_pixels,
@@ -296,8 +348,14 @@ pub fn process_optimal<S: ProgressSink>(
 
 fn make_new_img(source_pixels: &[(u8, u8, u8)], assignments: &[usize], sidelen: u32) -> Vec<u8> {
     let mut img = vec![0; (sidelen * sidelen * 3) as usize];
-    for (target_idx, source_idx) in assignments.iter().enumerate() {
-        let (r, g, b) = source_pixels[*source_idx];
+    for (target_idx, source_idx) in assignments
+        .iter()
+        .enumerate()
+        .take((sidelen * sidelen) as usize)
+    {
+        let Some(&(r, g, b)) = source_pixels.get(*source_idx) else {
+            continue;
+        };
         let base = target_idx * 3;
         img[base] = r;
         img[base + 1] = g;
@@ -347,9 +405,29 @@ impl Pixel {
     }
 }
 
-// Keep interactive web jobs practical. The old value made a 128px job attempt
-// more than two million swaps before it could report its first progress update.
 const SWAPS_PER_GENERATION_PER_PIXEL: usize = 32;
+const MAX_SWAPS_PER_GENERATION: usize = 262_144;
+const MAX_GENETIC_GENERATIONS: usize = 96;
+const CANCEL_CHECK_INTERVAL: usize = 4_096;
+const PROGRESS_HEARTBEAT_INTERVAL: usize = 32_768;
+
+fn genetic_max_dist(sidelen: u32, generation: usize) -> u32 {
+    let minimum = sidelen.clamp(1, 2) as f32;
+    if generation + 1 >= MAX_GENETIC_GENERATIONS {
+        return minimum as u32;
+    }
+    let t = generation as f32 / (MAX_GENETIC_GENERATIONS - 1) as f32;
+    (sidelen as f32 * (minimum / sidelen as f32).powf(t))
+        .round()
+        .clamp(minimum, sidelen as f32) as u32
+}
+
+fn pixel_assignments(pixels: &[Pixel], sidelen: u32) -> Vec<usize> {
+    pixels
+        .iter()
+        .map(|p| p.src_y as usize * sidelen as usize + p.src_x as usize)
+        .collect()
+}
 
 pub fn process_genetic<S: ProgressSink>(
     unprocessed: UnprocessedPreset,
@@ -357,14 +435,17 @@ pub fn process_genetic<S: ProgressSink>(
     tx: &mut S,
     #[cfg(not(target_arch = "wasm32"))] cancel: Arc<AtomicBool>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let source_img = image::ImageBuffer::from_vec(
+    util::validate_sidelen(settings.sidelen)?;
+    tx.send(ProgressMsg::Progress(0.001));
+    let source_img = util::rgb_image_from_raw(
         unprocessed.width,
         unprocessed.height,
         unprocessed.source_img.clone(),
-    )
-    .unwrap();
+    )?;
     // let start_time = std::time::Instant::now();
     let (source_pixels, target_pixels, weights) = util::get_images(source_img, &settings)?;
+    let proximity_importance =
+        util::normalized_proximity_importance(settings.proximity_importance, settings.sidelen);
 
     let mut pixels = source_pixels
         .iter()
@@ -373,24 +454,36 @@ pub fn process_genetic<S: ProgressSink>(
             let x = (i as u32 % settings.sidelen) as u16;
             let y = (i as u32 / settings.sidelen) as u16;
             let mut p = Pixel::new(x, y, (r, g, b), 0);
-            let h = p.calc_heuristic(
-                (x, y),
-                target_pixels[i],
-                weights[i],
-                settings.proximity_importance,
-            );
+            let h = p.calc_heuristic((x, y), target_pixels[i], weights[i], proximity_importance);
             p.update_heuristic(h);
             p
         })
         .collect::<Vec<_>>();
 
     let mut rng = frand::Rand::with_seed(12345);
-    let swaps_per_generation = SWAPS_PER_GENERATION_PER_PIXEL * pixels.len();
+    let swaps_per_generation =
+        (SWAPS_PER_GENERATION_PER_PIXEL * pixels.len()).clamp(1, MAX_SWAPS_PER_GENERATION);
 
-    let mut max_dist = settings.sidelen;
-    loop {
+    for generation in 0..MAX_GENETIC_GENERATIONS {
+        let max_dist = genetic_max_dist(settings.sidelen, generation);
         let mut swaps_made = 0;
-        for _ in 0..swaps_per_generation {
+        for attempt in 0..swaps_per_generation {
+            if attempt % CANCEL_CHECK_INTERVAL == 0 {
+                #[cfg(not(target_arch = "wasm32"))]
+                if is_cancelled(&cancel) {
+                    tx.send(ProgressMsg::Cancelled);
+                    return Ok(());
+                }
+            }
+            if attempt % PROGRESS_HEARTBEAT_INTERVAL == 0 {
+                let within_generation = attempt as f32 / swaps_per_generation as f32;
+                tx.send(ProgressMsg::Progress(
+                    0.001
+                        + 0.989 * (generation as f32 + within_generation)
+                            / MAX_GENETIC_GENERATIONS as f32,
+                ));
+            }
+
             let apos = rng.gen_range(0..pixels.len() as u32) as usize;
             let ax = apos as u16 % settings.sidelen as u16;
             let ay = apos as u16 / settings.sidelen as u16;
@@ -403,19 +496,11 @@ pub fn process_genetic<S: ProgressSink>(
             let t_a = target_pixels[apos];
             let t_b = target_pixels[bpos];
 
-            let a_on_b_h = pixels[apos].calc_heuristic(
-                (bx, by),
-                t_b,
-                weights[bpos],
-                settings.proximity_importance,
-            );
+            let a_on_b_h =
+                pixels[apos].calc_heuristic((bx, by), t_b, weights[bpos], proximity_importance);
 
-            let b_on_a_h = pixels[bpos].calc_heuristic(
-                (ax, ay),
-                t_a,
-                weights[apos],
-                settings.proximity_importance,
-            );
+            let b_on_a_h =
+                pixels[bpos].calc_heuristic((ax, ay), t_a, weights[apos], proximity_importance);
 
             let improvement_a = pixels[apos].h - b_on_a_h;
             let improvement_b = pixels[bpos].h - a_on_b_h;
@@ -428,21 +513,11 @@ pub fn process_genetic<S: ProgressSink>(
             }
         }
 
-        #[cfg(not(target_arch = "wasm32"))]
-        {
-            if cancel.load(std::sync::atomic::Ordering::Relaxed) {
-                println!("cancelled");
-                tx.send(ProgressMsg::Cancelled);
-                return Ok(());
-            }
-        }
-
-        let assignments = pixels
-            .iter()
-            .map(|p| p.src_y as usize * settings.sidelen as usize + p.src_x as usize)
-            .collect::<Vec<_>>();
+        let assignments = pixel_assignments(&pixels, settings.sidelen);
         //debug_print(format!("max_dist = {max_dist}, swaps made = {swaps_made}"));
-        if max_dist < 4 && swaps_made < 10 {
+        let converged = max_dist < 4 && swaps_made < 10;
+        let budget_exhausted = generation + 1 == MAX_GENETIC_GENERATIONS;
+        if converged || budget_exhausted {
             //let dir_name = util::save_result(target, base_name, source, assignments, img)?;
             tx.send(ProgressMsg::Done(Preset {
                 inner: UnprocessedPreset {
@@ -465,11 +540,11 @@ pub fn process_genetic<S: ProgressSink>(
             data,
         });
         tx.send(ProgressMsg::Progress(
-            (1.0 - max_dist as f32 / settings.sidelen as f32).max(0.01),
+            0.001 + 0.989 * (generation + 1) as f32 / MAX_GENETIC_GENERATIONS as f32,
         ));
-
-        max_dist = (max_dist as f32 * 0.95).max(2.0) as u32;
     }
+
+    unreachable!("the bounded genetic loop always returns on its final generation")
 }
 
 // fn serialize_assignments(assignments: Vec<usize>) -> String {
@@ -504,5 +579,94 @@ pub fn process<S: ProgressSink>(
     match settings.algorithm {
         Algorithm::Optimal => process_optimal(unprocessed, settings, tx),
         Algorithm::Genetic => process_genetic(unprocessed, settings, tx),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use uuid::Uuid;
+
+    #[test]
+    fn generated_preview_ignores_invalid_assignment_indices() {
+        let image = make_new_img(&[(1, 2, 3)], &[0, 99], 2);
+        assert_eq!(&image[0..3], &[1, 2, 3]);
+        assert_eq!(&image[3..6], &[0, 0, 0]);
+        assert_eq!(image.len(), 12);
+    }
+
+    #[test]
+    fn genetic_distance_schedule_is_bounded_and_monotonic() {
+        let mut previous = genetic_max_dist(256, 0);
+        assert_eq!(previous, 256);
+        for generation in 1..MAX_GENETIC_GENERATIONS {
+            let current = genetic_max_dist(256, generation);
+            assert!(current <= previous);
+            assert!(current >= 2);
+            previous = current;
+        }
+        assert_eq!(previous, 2);
+    }
+
+    #[test]
+    fn normalized_spatial_penalty_is_resolution_independent() {
+        let low = heuristic(
+            (0, 0),
+            (8, 0),
+            (0, 0, 0),
+            (0, 0, 0),
+            0,
+            util::normalized_proximity_importance(10, 64),
+        );
+        let high = heuristic(
+            (0, 0),
+            (16, 0),
+            (0, 0, 0),
+            (0, 0, 0),
+            0,
+            util::normalized_proximity_importance(10, 128),
+        );
+        assert_eq!(low, high);
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn optimal_rejects_impractical_resolution_before_allocating() {
+        let mut settings = GenerationSettings::default(Uuid::nil(), "test".into());
+        settings.sidelen = MAX_OPTIMAL_SIDELEN + 1;
+        settings.algorithm = Algorithm::Optimal;
+        let input = UnprocessedPreset {
+            name: "input".into(),
+            width: 1,
+            height: 1,
+            source_img: vec![0, 0, 0],
+        };
+        let mut sink = |_message: ProgressMsg| {};
+        let error = process_optimal(input, settings, &mut sink, Arc::new(AtomicBool::new(false)))
+            .unwrap_err();
+        assert!(error.to_string().contains("High quality"));
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[test]
+    fn one_pixel_genetic_job_finishes_within_budget() {
+        let mut settings = GenerationSettings::default(Uuid::nil(), "test".into());
+        settings.sidelen = 1;
+        let input = UnprocessedPreset {
+            name: "input".into(),
+            width: 1,
+            height: 1,
+            source_img: vec![12, 34, 56],
+        };
+        let mut messages = Vec::new();
+        {
+            let mut sink = |message: ProgressMsg| messages.push(message);
+            process_genetic(input, settings, &mut sink, Arc::new(AtomicBool::new(false))).unwrap();
+        }
+        assert!(
+            messages
+                .iter()
+                .any(|message| matches!(message, ProgressMsg::Done(_)))
+        );
     }
 }

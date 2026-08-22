@@ -1,11 +1,8 @@
 <!DOCTYPE html>
-<html>
-<meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
-
-<!-- Disable zooming: -->
-<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
-
+<html lang="en">
 <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Portraitify — Image Transformation</title>
 
     <meta name="description" content="Turn any image into a custom portrait with an animated pixel transformation.">
@@ -258,13 +255,20 @@
             <span class="icon-text">Based on the original Obamify project</span>
         </a>
     </div>
-    <!--Register Service Worker. this will cache the wasm / js scripts for offline use (for PWA functionality). -->
-    <!-- Force refresh (Ctrl + F5) to load the latest files instead of cached files  -->
+    <!-- Register the update-safe, network-first service worker. -->
     <script>
-        // We disable caching during development so that we always view the latest version.
         if ('serviceWorker' in navigator && window.location.hash !== "#dev") {
-            window.addEventListener('load', function () {
-                navigator.serviceWorker.register('sw.js');
+            window.addEventListener('load', async function () {
+                try {
+                    const registration = await navigator.serviceWorker.register(
+                        new URL('sw.js', document.baseURI),
+                        { scope: './', updateViaCache: 'none' }
+                    );
+                    await registration.update();
+                } catch (error) {
+                    // PWA support is optional; a registration problem must not block the app.
+                    console.warn('Service worker registration failed:', error);
+                }
             });
         }
 

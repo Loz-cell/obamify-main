@@ -1,14 +1,23 @@
 use eframe::wasm_bindgen::prelude::*;
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 use web_sys::DedicatedWorkerGlobalScope;
 use web_sys::js_sys;
 
 #[derive(Serialize, Deserialize)]
 pub enum WorkerReq {
     Process {
+        job_id: Uuid,
         source: crate::app::preset::UnprocessedPreset,
         settings: super::GenerationSettings,
     },
+}
+
+#[derive(Serialize, Deserialize)]
+pub enum WorkerEvent {
+    Ready,
+    Message { job_id: Uuid, msg: ProgressMsg },
+    Fatal(String),
 }
 
 use crate::app::calculate::ProgressMsg;
@@ -28,23 +37,30 @@ pub fn worker_entry() {
         let req: WorkerReq = match serde_wasm_bindgen::from_value(e.data()) {
             Ok(v) => v,
             Err(err) => {
-                let _ = global_for_handler.post_message(
-                    &serde_wasm_bindgen::to_value(&ProgressMsg::Error(format!("bad req: {err}")))
-                        .unwrap(),
-                );
+                let event = WorkerEvent::Fatal(format!("Unable to decode worker request: {err}"));
+                if let Ok(value) = serde_wasm_bindgen::to_value(&event) {
+                    let _ = global_for_handler.post_message(&value);
+                }
                 return;
             }
         };
 
         match req {
-            WorkerReq::Process { source, settings } => {
+            WorkerReq::Process {
+                job_id,
+                source,
+                settings,
+            } => {
                 // Run job; if you need to keep the UI responsive in the worker,
                 // wrap in an async task and yield occasionally.
                 let global2 = global_for_handler.clone();
 
                 // progress sink -> postMessage
                 let mut sink = |msg: ProgressMsg| {
-                    let _ = global2.post_message(&serde_wasm_bindgen::to_value(&msg).unwrap());
+                    let event = WorkerEvent::Message { job_id, msg };
+                    if let Ok(value) = serde_wasm_bindgen::to_value(&event) {
+                        let _ = global2.post_message(&value);
+                    }
                 };
 
                 // Confirm immediately that the worker received and decoded the job.
@@ -61,4 +77,8 @@ pub fn worker_entry() {
 
     global.set_onmessage(Some(handler.as_ref().unchecked_ref()));
     handler.forget();
+
+    if let Ok(value) = serde_wasm_bindgen::to_value(&WorkerEvent::Ready) {
+        let _ = global.post_message(&value);
+    }
 }

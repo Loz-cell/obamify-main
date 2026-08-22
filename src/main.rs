@@ -45,9 +45,9 @@ fn start_app() {
                 },
                 power_preference: egui_wgpu::wgpu::PowerPreference::HighPerformance,
                 device_descriptor: std::sync::Arc::new(|_adapter| {
-                    let mut limits = egui_wgpu::wgpu::Limits::downlevel_webgl2_defaults();
-                    // Clamp texture size to 2048 for WebGL compatibility
-                    limits.max_texture_dimension_2d = 4096;
+                    // The web app only needs 1024px render targets. Requiring 4096 here
+                    // rejected otherwise capable WebGL2 devices before the UI started.
+                    let limits = egui_wgpu::wgpu::Limits::downlevel_webgl2_defaults();
                     egui_wgpu::wgpu::DeviceDescriptor {
                         label: Some("egui_device"),
                         required_features: egui_wgpu::wgpu::Features::default(),
@@ -114,12 +114,13 @@ pub fn main() {
         return;
     }
 
-    // Otherwise, if we have a DedicatedWorkerGlobalScope, we’re in a worker → install worker.
+    // In a module worker, worker.js installs the exported worker entry after
+    // wasm initialization completes. Do not install it here as well: doing so
+    // replaces the handler and leaks the first Closure.
     if web_sys::js_sys::global()
         .dyn_ref::<web_sys::DedicatedWorkerGlobalScope>()
         .is_some()
     {
-        obamify::worker_entry(); // <- your existing function that sets onmessage, etc.
         return;
     }
 

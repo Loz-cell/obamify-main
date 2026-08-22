@@ -8,26 +8,63 @@ permissions:
     contents: read
     deployments: write
 
+concurrency:
+    group: cloudflare-pages-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    TRUNK_VERSION: "0.21.14"
+    TRUNK_SHA256: "f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b"
+
 jobs:
     build-and-deploy:
+        # Cloudflare deployment is opt-in. Add a repository variable named
+        # CLOUDFLARE_PAGES_ENABLED=true after configuring both required secrets.
+        if: ${{ vars.CLOUDFLARE_PAGES_ENABLED == 'true' }}
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
             - name: Setup toolchain for wasm
-              run: |
-                  rustup update stable
-                  rustup default stable
-                  rustup set profile minimal
-                  rustup target add wasm32-unknown-unknown
+              uses: dtolnay/rust-toolchain@1.85.0
+              with:
+                  targets: wasm32-unknown-unknown
 
             - name: Rust Cache
               uses: Swatinem/rust-cache@v2
 
             - name: Download and install Trunk binary
-              run: wget -qO- https://github.com/thedodd/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  base="https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}"
+                  curl --fail --location --silent --show-error --output trunk.tar.gz \
+                    "${base}/trunk-x86_64-unknown-linux-gnu.tar.gz"
+                  echo "${TRUNK_SHA256}  trunk.tar.gz" | sha256sum --check -
+                  tar --extract --gzip --file trunk.tar.gz trunk
+                  ./trunk --version
 
             - name: Build
               run: ./trunk build --release --public-url "/"
+
+            - name: Smoke test generated worker assets
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 - <<'PY'
+                  import re
+                  from pathlib import Path
+
+                  dist = Path("dist")
+                  required = ["index.html", "worker.js", "sw.js", "manifest.json"]
+                  missing = [name for name in required if not (dist / name).is_file()]
+                  assert not missing, f"missing generated assets: {missing}"
+                  modules = list(dist.glob("obamify-*.js"))
+                  assert len(modules) == 1, f"expected one hashed JS module: {modules}"
+                  module = modules[0]
+                  assert re.fullmatch(r"obamify-[A-Za-z0-9_-]+\.js", module.name), module.name
+                  assert (dist / f"{module.stem}_bg.wasm").is_file()
+                  assert module.name in (dist / "index.html").read_text(encoding="utf-8")
+                  PY
 
             - name: Deploy to Cloudflare Pages
               uses: cloudflare/wrangler-action@v3

@@ -14,18 +14,44 @@ use crate::app::gif_recorder::GIF_RESOLUTION;
 use crate::app::gif_recorder::GifStatus;
 use crate::app::preset::Preset;
 use crate::app::preset::UnprocessedPreset;
+#[cfg(target_arch = "wasm32")]
+use crate::app::preset::presets_for_storage;
 use eframe::App;
 use eframe::Frame;
 use egui::Color32;
 use egui::Modal;
 use egui::TextureHandle;
 use egui::Window;
+use image::ImageDecoder;
 use image::buffer::ConvertBuffer;
 use image::imageops;
+use std::collections::VecDeque;
+use std::io::Cursor;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::Ordering;
 use uuid::Uuid;
+
+const MAX_UPLOAD_BYTES: usize = 25 * 1024 * 1024;
+const MAX_UPLOAD_PIXELS: u64 = 40_000_000;
+const MAX_UPLOAD_SIDE: u32 = 16_384;
+
+#[derive(Clone, Copy)]
+enum ImageImportPurpose {
+    NewTransformation,
+    ReplaceSource { config_id: Uuid },
+}
+
+enum ImageImportEvent {
+    Loaded {
+        purpose: ImageImportPurpose,
+        name: String,
+        image: SourceImg,
+    },
+    Failed(String),
+    Cancelled,
+}
 
 // #[cfg(not(target_arch = "wasm32"))]
 // use std::thread as wasm_thread;
@@ -47,6 +73,7 @@ pub(crate) struct GuiState {
     //pub fps_text: String,
     show_progress_modal: Option<Uuid>,
     last_progress: f32,
+    progress_error: Option<String>,
     process_cancelled: Arc<AtomicBool>,
     //pub currently_processing: Option<Preset>,
     pub presets: Vec<Preset>,
@@ -55,6 +82,8 @@ pub(crate) struct GuiState {
     saved_config: Option<(SourceImg, GenerationSettings)>,
     pub current_preset: usize,
     error_message: Option<String>,
+    image_dialog_open: bool,
+    image_import_results: Arc<Mutex<VecDeque<ImageImportEvent>>>,
 
     has_obamified_once: bool,
 }
@@ -72,6 +101,7 @@ impl GuiState {
             mode: GuiMode::Transform,
             show_progress_modal: None,
             last_progress: 0.0,
+            progress_error: None,
             process_cancelled: Arc::new(AtomicBool::new(false)),
             #[cfg(not(target_arch = "wasm32"))]
             last_mouse_pos: None,
@@ -83,18 +113,27 @@ impl GuiState {
             saved_config: None,
             current_preset,
             error_message: None,
+            image_dialog_open: false,
+            image_import_results: Arc::new(Mutex::new(VecDeque::new())),
             has_obamified_once,
         }
     }
 
     fn show_progress_modal(&mut self, id: Uuid) {
         self.show_progress_modal = Some(id);
+        self.last_progress = 0.0;
+        self.progress_error = None;
+        // Each native job gets its own cancellation token. Reusing an Arc and
+        // resetting it here could revive a thread from the previous job.
+        self.process_cancelled = Arc::new(AtomicBool::new(false));
         #[cfg(target_arch = "wasm32")]
         hide_icons();
     }
 
     fn hide_progress_modal(&mut self) {
         self.show_progress_modal = None;
+        self.last_progress = 0.0;
+        self.progress_error = None;
         #[cfg(target_arch = "wasm32")]
         show_icons();
     }
@@ -136,7 +175,33 @@ fn hide_icons() {
 
 impl App for ObamifyApp {
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
-        eframe::set_value(storage, "portraitify_presets_v1", &self.gui.presets);
+        #[cfg(target_arch = "wasm32")]
+        let (persistable, omitted) = presets_for_storage(&self.gui.presets);
+        #[cfg(not(target_arch = "wasm32"))]
+        let (persistable, omitted) = (
+            self.gui
+                .presets
+                .iter()
+                .filter(|preset| preset.validate().is_ok())
+                .cloned()
+                .collect::<Vec<_>>(),
+            self.gui
+                .presets
+                .iter()
+                .filter(|preset| preset.validate().is_err())
+                .count(),
+        );
+        eframe::set_value(storage, "portraitify_presets_v1", &persistable);
+        if omitted > 0 {
+            #[cfg(target_arch = "wasm32")]
+            self.gui.show_error(format!(
+                "{omitted} older or invalid transformation(s) were not saved because browser storage is limited."
+            ));
+            #[cfg(not(target_arch = "wasm32"))]
+            self.gui.show_error(format!(
+                "{omitted} invalid transformation(s) were not saved."
+            ));
+        }
         eframe::set_value(
             storage,
             "has_portraitified_once_v1",
@@ -149,6 +214,63 @@ impl App for ObamifyApp {
         };
 
         let device = &rs.device;
+
+        self.gif_recorder.poll_save_result();
+
+        let image_import_events = {
+            let mut queue = self.gui.image_import_results.lock().unwrap();
+            queue.drain(..).collect::<Vec<_>>()
+        };
+        for event in image_import_events {
+            self.gui.image_dialog_open = false;
+            match event {
+                ImageImportEvent::Loaded {
+                    purpose,
+                    name,
+                    image,
+                } => {
+                    let image = ensure_reasonable_size(image);
+                    match purpose {
+                        ImageImportPurpose::NewTransformation => {
+                            self.gui.configuring_generation = Some((
+                                image,
+                                GenerationSettings::default(Uuid::new_v4(), name),
+                                GuiImageCache::default(),
+                            ));
+                            #[cfg(target_arch = "wasm32")]
+                            hide_icons();
+                        }
+                        ImageImportPurpose::ReplaceSource { config_id } => {
+                            if let Some((source, settings, cache)) =
+                                self.gui.configuring_generation.as_mut()
+                            {
+                                if settings.id != config_id {
+                                    continue;
+                                }
+                                *source = image;
+                                settings.name = name;
+                                settings.source_crop_scale = CropScale::identity();
+                                *cache = GuiImageCache::default();
+                            }
+                        }
+                    }
+                }
+                ImageImportEvent::Failed(error) => {
+                    self.gui.show_error(error);
+                    #[cfg(target_arch = "wasm32")]
+                    if self.gui.configuring_generation.is_none() {
+                        show_icons();
+                    }
+                }
+                ImageImportEvent::Cancelled =>
+                {
+                    #[cfg(target_arch = "wasm32")]
+                    if self.gui.configuring_generation.is_none() {
+                        show_icons();
+                    }
+                }
+            }
+        }
         // Resize handling (match the egui "central panel" size)
         //let available = ctx.available_rect();
         // let target_size = (
@@ -214,6 +336,7 @@ impl App for ObamifyApp {
                     if self.gif_recorder.no_inflight() {
                         if let Err(e) = self.get_color_image_data(device, &rs.queue) {
                             self.gif_recorder.status = GifStatus::Error(e.to_string());
+                            self.gui.animate = false;
                         }
                     }
                     match self.gif_recorder.try_write_frame() {
@@ -242,6 +365,7 @@ impl App for ObamifyApp {
                                 // queue next frame
                                 if let Err(e) = self.get_color_image_data(device, &rs.queue) {
                                     self.gif_recorder.status = GifStatus::Error(e.to_string());
+                                    self.gui.animate = false;
                                 }
                             }
                         }
@@ -289,16 +413,20 @@ impl App for ObamifyApp {
                                 self.init_canvas(device, &rs.queue);
                             }
 
-                            while let Some(msg) = self.get_latest_msg() {
+                            while let Some(msg) = self.get_latest_drawing_msg() {
                                 match msg {
                                     ProgressMsg::UpdatePreview {
                                         width,
                                         height,
                                         data,
                                     } => {
-                                        let image =
-                                            image::ImageBuffer::from_vec(width, height, data);
-                                        self.preview_image = image;
+                                        match image::ImageBuffer::from_vec(width, height, data) {
+                                            Some(image) => self.preview_image = Some(image),
+                                            None => self.gui.show_error(
+                                                "Drawing processor returned an invalid preview"
+                                                    .to_owned(),
+                                            ),
+                                        }
                                     }
                                     ProgressMsg::Cancelled => {
                                         self.gui.process_cancelled.store(false, Ordering::Relaxed);
@@ -309,9 +437,22 @@ impl App for ObamifyApp {
                                     ProgressMsg::UpdateAssignments(assignments) => {
                                         self.sim.set_assignments(assignments, self.size.0)
                                     }
-                                    ProgressMsg::Progress(_) => todo!(),
-                                    ProgressMsg::Done(_) => todo!(),
-                                    ProgressMsg::Error(_) => todo!(),
+                                    ProgressMsg::Progress(progress) => {
+                                        self.gui.last_progress = progress.clamp(0.0, 1.0);
+                                    }
+                                    ProgressMsg::Done(preset) => {
+                                        if let Err(error) = preset.validate() {
+                                            self.gui.show_error(format!(
+                                                "Drawing processor returned an invalid preset: {error}"
+                                            ));
+                                        }
+                                    }
+                                    ProgressMsg::Error(error) => {
+                                        self.gui.show_error(format!(
+                                            "Drawing processor failed: {error}"
+                                        ));
+                                        self.preview_image = None;
+                                    }
                                 }
                             }
 
@@ -320,6 +461,7 @@ impl App for ObamifyApp {
                                 .on_hover_text("transform mode")
                                 .clicked()
                             {
+                                self.current_drawing_id.fetch_add(1, Ordering::SeqCst);
                                 self.gui.mode = GuiMode::Transform;
                                 self.change_sim(device, &rs.queue, self.gui.presets[0].clone(), 0);
                             }
@@ -353,8 +495,6 @@ impl App for ObamifyApp {
                                 })
                                 .clicked()
                             {
-                                self.gif_recorder.status = GifStatus::Recording;
-                                self.gif_recorder.encoder = None;
                                 if let Err(err) = self
                                     .gif_recorder
                                     .init_encoder(self.colors.read().unwrap().as_ref())
@@ -509,20 +649,13 @@ impl App for ObamifyApp {
                                         ));
                                         #[cfg(target_arch = "wasm32")]
                                         hide_icons();
-                                    } else {
+                                    } else if !self.gui.image_dialog_open {
+                                        self.gui.image_dialog_open = true;
                                         prompt_image(
                                             "Choose an image to transform",
-                                            self,
-                                            |name: String, mut img: SourceImg, app: &mut ObamifyApp| {
-                                                img = ensure_reasonable_size(img);
-                                                app.gui.configuring_generation = Some((
-                                                    img,
-                                                    GenerationSettings::default(Uuid::new_v4(), name),
-                                                    GuiImageCache::default(),
-                                                ));
-                                                #[cfg(target_arch = "wasm32")]
-                                                hide_icons();
-                                            },
+                                            ctx,
+                                            Arc::clone(&self.gui.image_import_results),
+                                            ImageImportPurpose::NewTransformation,
                                         );
                                     }
                                 }
@@ -595,7 +728,7 @@ impl App for ObamifyApp {
 
                             ui.separator();
 
-                            let mut change_source = false;
+                            let mut replace_source_for = None;
 
                             ui.allocate_ui_with_layout(
                                 egui::vec2(max_w, 0.0),
@@ -607,14 +740,16 @@ impl App for ObamifyApp {
                                     if let Some((source_img, settings, cache)) =
                                         self.gui.configuring_generation.as_mut()
                                     {
-                                        change_source = image_crop_gui(
+                                        if image_crop_gui(
                                             "source",
                                             ui,
                                             source_img,
                                             &mut settings.source_crop_scale,
                                             &mut cache.source_preview,
                                             true,
-                                        );
+                                        ) {
+                                            replace_source_for = Some(settings.id);
+                                        }
                                         if is_landscape {
                                             // ./arrow-right.svg
                                             ui.vertical(|ui| {
@@ -649,20 +784,16 @@ impl App for ObamifyApp {
                                 },
                             );
 
-                            if change_source {
-                                prompt_image(
-                                    "Choose an image to transform",
-                                    self,
-                                    |_, mut img: SourceImg, app: &mut ObamifyApp| {
-                                        img = ensure_reasonable_size(img);
-                                        if let Some((src, _, cache)) =
-                                            &mut app.gui.configuring_generation
-                                        {
-                                            *src = img;
-                                            cache.source_preview = None;
-                                        }
-                                    },
-                                );
+                            if let Some(config_id) = replace_source_for {
+                                if !self.gui.image_dialog_open {
+                                    self.gui.image_dialog_open = true;
+                                    prompt_image(
+                                        "Choose an image to transform",
+                                        ctx,
+                                        Arc::clone(&self.gui.image_import_results),
+                                        ImageImportPurpose::ReplaceSource { config_id },
+                                    );
+                                }
                             }
 
                             ui.separator();
@@ -677,6 +808,14 @@ impl App for ObamifyApp {
                                             egui::vec2(max_w, 0.0),
                                             egui::Layout::top_down(egui::Align::Min),
                                             |ui| {
+                                                // The exact matcher grows as O(side^6) and is not
+                                                // interactive at useful image sizes. Keep the UI on
+                                                // the bounded matcher so every exposed setting has a
+                                                // predictable finish time.
+                                                settings.algorithm =
+                                                    calculate::util::Algorithm::Genetic;
+                                                settings.sidelen = settings.sidelen.clamp(64, 256);
+
                                                 let slider_w = ui.available_width().min(260.0);
                                                 ui.add_sized(
                                                     [slider_w, 20.0],
@@ -697,27 +836,9 @@ impl App for ObamifyApp {
                                                     .text("Keep source structure"),
                                                 );
 
-                                                let mut algorithm = match settings.algorithm {
-                                                    calculate::util::Algorithm::Optimal => {
-                                                        "High quality"
-                                                    }
-                                                    calculate::util::Algorithm::Genetic => "Fast",
-                                                };
-
-                                                egui::ComboBox::from_id_salt("algorithm_select")
-                                                    .selected_text(algorithm)
-                                                    .show_ui(ui, |ui| {
-                                                        if ui.button("High quality").clicked() {
-                                                            algorithm = "High quality";
-                                                            settings.algorithm =
-                                                                calculate::util::Algorithm::Optimal;
-                                                        }
-                                                        if ui.button("Fast").clicked() {
-                                                            algorithm = "Fast";
-                                                            settings.algorithm =
-                                                                calculate::util::Algorithm::Genetic;
-                                                        }
-                                                    });
+                                                ui.small(
+                                                    "Algorithm: Fast (bounded for browser use)",
+                                                );
                                             },
                                         );
                                     });
@@ -731,17 +852,13 @@ impl App for ObamifyApp {
                                     if let Some((img, mut settings, _)) =
                                         self.gui.configuring_generation.take()
                                     {
+                                        while self.get_latest_msg().is_some() {}
+                                        settings.name = normalize_preset_name(&settings.name);
                                         self.gui.show_progress_modal(settings.id);
                                         self.gui.saved_config =
                                             Some((img.clone(), settings.clone()));
                                         //self.gui.currently_processing = Some(path.clone());
                                         //self.change_sim(device, path.clone(), false);
-
-                                        // adjust for consistency across resolutions
-                                        settings.proximity_importance =
-                                            (settings.proximity_importance as f32
-                                                / (settings.sidelen as f32 / 128.0))
-                                                as i64;
 
                                         self.gui
                                             .process_cancelled
@@ -767,21 +884,29 @@ impl App for ObamifyApp {
 
                                         #[cfg(not(target_arch = "wasm32"))]
                                         {
+                                            let job_id = settings.id;
+                                            self.active_native_job = Some(job_id);
                                             std::thread::spawn({
                                                 let tx = self.progress_tx.clone();
                                                 let cancelled = self.gui.process_cancelled.clone();
                                                 move || {
+                                                    let event_tx = tx.clone();
+                                                    let mut sink = move |msg| {
+                                                        let _ = event_tx.send(
+                                                            super::NativeWorkerEvent {
+                                                                job_id,
+                                                                msg,
+                                                            },
+                                                        );
+                                                    };
                                                     let result = calculate::process(
                                                         unprocessed,
                                                         settings,
-                                                        &mut tx.clone(),
+                                                        &mut sink,
                                                         cancelled,
                                                     );
                                                     if let Err(err) = result {
-                                                        tx.send(ProgressMsg::Error(
-                                                            err.to_string(),
-                                                        ))
-                                                        .ok();
+                                                        sink(ProgressMsg::Error(err.to_string()));
                                                     }
                                                 }
                                             });
@@ -800,27 +925,37 @@ impl App for ObamifyApp {
         }
 
         if let Some(progress_id) = self.gui.show_progress_modal {
-            Window::new(progress_id.to_string())
-                .title_bar(false)
-                .collapsible(false)
-                .movable(false)
-                .resizable(false)
-                .anchor(egui::Align2::CENTER_BOTTOM, (0.0, 0.0))
-                .show(ctx, |ui| {
-                    let processing_label_message = "Building your transformation...";
-                    ui.vertical(|ui| {
+            Modal::new(egui::Id::new(("processing", progress_id))).show(ctx, |ui| {
+                let processing_label_message = "Building your transformation...";
+                ui.vertical(|ui| {
                         ui.set_min_width(ui.available_width().min(400.0));
                         while let Some(msg) = self.get_latest_msg() {
                             match msg {
                                 ProgressMsg::Done(new_preset) => {
+                                    if let Err(error) = new_preset.validate() {
+                                        self.gui.progress_error = Some(format!(
+                                            "Background processor returned an invalid result: {error}"
+                                        ));
+                                        self.preview_image = None;
+                                        break;
+                                    }
                                     self.preview_image = None;
                                     self.resize_textures(
                                         device,
                                         (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
-                                        false,
+                                        true,
                                     );
                                     //self.gui.presets = get_presets();
                                     self.gui.presets.push(new_preset.clone());
+                                    #[cfg(target_arch = "wasm32")]
+                                    {
+                                        let (_, omitted) = presets_for_storage(&self.gui.presets);
+                                        if omitted > 0 {
+                                            self.gui.show_error(format!(
+                                                "Browser storage is full; {omitted} older transformation(s) will remain available only until this tab is closed."
+                                            ));
+                                        }
+                                    }
                                     self.change_sim(
                                         device,
                                         &rs.queue,
@@ -834,21 +969,39 @@ impl App for ObamifyApp {
                                     break;
                                 }
                                 ProgressMsg::Progress(p) => {
-                                    self.gui.last_progress = p;
+                                    self.gui.last_progress = p.clamp(0.0, 1.0);
                                 }
                                 ProgressMsg::Error(err) => {
-                                    ui.label(format!("error: {}", err));
-                                    if ui.button("close").clicked() {
-                                        ui.close();
-                                    }
+                                    self.gui.progress_error = Some(err);
+                                    self.gui.process_cancelled.store(true, Ordering::Relaxed);
+                                    #[cfg(target_arch = "wasm32")]
+                                    self.cancel_worker_job();
+                                    break;
                                 }
                                 ProgressMsg::UpdatePreview {
                                     width,
                                     height,
                                     data,
                                 } => {
-                                    let image = image::ImageBuffer::from_vec(width, height, data);
-                                    self.preview_image = image;
+                                    match image::ImageBuffer::from_vec(width, height, data) {
+                                        Some(image) => self.preview_image = Some(image),
+                                        None => {
+                                            self.gui.progress_error = Some(
+                                                "Background processor returned an invalid preview"
+                                                    .to_owned(),
+                                            );
+                                            #[cfg(target_arch = "wasm32")]
+                                            self.cancel_worker_job();
+                                            #[cfg(not(target_arch = "wasm32"))]
+                                            {
+                                                self.gui
+                                                    .process_cancelled
+                                                    .store(true, Ordering::Relaxed);
+                                                self.active_native_job = None;
+                                            }
+                                            break;
+                                        }
+                                    }
                                 }
                                 ProgressMsg::Cancelled => {
                                     self.preview_image = None;
@@ -859,6 +1012,7 @@ impl App for ObamifyApp {
                                     );
                                     self.gui.hide_progress_modal();
                                     ui.close();
+                                    break;
                                 }
                                 ProgressMsg::UpdateAssignments(assignments) => {
                                     self.sim.set_assignments(assignments, self.size.0)
@@ -866,78 +1020,109 @@ impl App for ObamifyApp {
                             }
                         }
 
-                        if self.gui.process_cancelled.load(Ordering::Relaxed) {
-                            ui.label("cancelling...");
-                        } else if self.gui.last_progress == 0.0 {
-                            ui.label("preparing...");
+                        if let Some(error) = self.gui.progress_error.clone() {
+                            ui.colored_label(Color32::LIGHT_RED, format!("Error: {error}"));
+                            if ui.button("close").clicked() {
+                                #[cfg(target_arch = "wasm32")]
+                                self.cancel_worker_job();
+                                self.gui.process_cancelled.store(true, Ordering::Relaxed);
+                                self.preview_image = None;
+                                self.resize_textures(
+                                    device,
+                                    (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
+                                    true,
+                                );
+                                self.gui.hide_progress_modal();
+                                ui.close();
+                            }
                         } else {
-                            ui.label(processing_label_message);
-                        }
-                        ui.add(egui::ProgressBar::new(self.gui.last_progress).show_percentage());
+                            if self.gui.process_cancelled.load(Ordering::Relaxed) {
+                                ui.label("cancelling...");
+                            } else if self.gui.last_progress == 0.0 {
+                                ui.label("preparing...");
+                            } else {
+                                ui.label(processing_label_message);
+                            }
+                            ui.add(
+                                egui::ProgressBar::new(self.gui.last_progress.clamp(0.0, 1.0))
+                                    .show_percentage(),
+                            );
 
-                        ui.horizontal(|ui| {
                             if ui.button("cancel").clicked() {
                                 #[cfg(target_arch = "wasm32")]
-                                {
-                                    if let Some(w) = &self.worker {
-                                        w.terminate();
-                                    }
-                                    self.worker = None;
-                                    self.preview_image = None;
-                                    self.resize_textures(
-                                        device,
-                                        (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
-                                        false,
-                                    );
-                                    self.gui.hide_progress_modal();
-                                    ui.close();
-                                }
+                                self.cancel_worker_job();
                                 self.gui.process_cancelled.store(true, Ordering::Relaxed);
-                                self.gui.last_progress = 0.0;
+                                #[cfg(not(target_arch = "wasm32"))]
+                                {
+                                    self.active_native_job = None;
+                                }
+                                self.preview_image = None;
+                                self.resize_textures(
+                                    device,
+                                    (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION),
+                                    true,
+                                );
+                                self.gui.hide_progress_modal();
+                                ui.close();
                             }
-                        })
-                    });
+                        }
                 });
+            });
         } else if !self.gif_recorder.not_recording() {
             Modal::new(format!("recording_progress_{}", self.gif_recorder.id).into()).show(
                 ctx,
-                |ui| {
-                    match self.gif_recorder.status.clone() {
-                        GifStatus::Recording => {
-                            ui.label("recording gif...");
-                            if ui.button("cancel").clicked() {
-                                self.stop_recording_gif(device, &rs.queue);
-                                self.gui.animate = false;
-                            }
+                |ui| match self.gif_recorder.status.clone() {
+                    GifStatus::Recording => {
+                        ui.label("recording gif...");
+                        if ui.button("cancel").clicked() {
+                            self.stop_recording_gif(device, &rs.queue);
+                            self.gui.animate = false;
                         }
+                    }
 
-                        GifStatus::Error(err) => {
-                            ui.label(format!("Error: {}", err));
-                            ui.horizontal(|ui| {
-                                if ui.button("close").clicked() {
-                                    self.stop_recording_gif(device, &rs.queue);
-                                }
-                            });
-                        }
-                        #[cfg(not(target_arch = "wasm32"))]
-                        GifStatus::Complete(path) => {
-                            ui.label("gif saved!");
-                            ui.horizontal(|ui| {
-                                if ui.button("open file").clicked() {
-                                    opener::reveal(path).ok();
-                                }
-                                if ui.button("close").clicked() {
-                                    self.stop_recording_gif(device, &rs.queue);
-                                }
-                            });
-                        }
-                        #[cfg(target_arch = "wasm32")]
-                        GifStatus::Complete => {
-                            // save opens dialog automatically
+                    GifStatus::Saving => {
+                        ui.label("saving gif...");
+                        ui.spinner();
+                        if ui.button("cancel").clicked() {
                             self.stop_recording_gif(device, &rs.queue);
                         }
-                        GifStatus::None => unreachable!(),
                     }
+
+                    GifStatus::Cancelled => {
+                        ui.label("gif save cancelled");
+                        if ui.button("close").clicked() {
+                            self.stop_recording_gif(device, &rs.queue);
+                        }
+                    }
+
+                    GifStatus::Error(err) => {
+                        ui.label(format!("Error: {}", err));
+                        ui.horizontal(|ui| {
+                            if ui.button("close").clicked() {
+                                self.stop_recording_gif(device, &rs.queue);
+                            }
+                        });
+                    }
+                    #[cfg(not(target_arch = "wasm32"))]
+                    GifStatus::Complete(path) => {
+                        ui.label("gif saved!");
+                        ui.horizontal(|ui| {
+                            if ui.button("open file").clicked() {
+                                opener::reveal(path).ok();
+                            }
+                            if ui.button("close").clicked() {
+                                self.stop_recording_gif(device, &rs.queue);
+                            }
+                        });
+                    }
+                    #[cfg(target_arch = "wasm32")]
+                    GifStatus::Complete => {
+                        ui.label("gif saved!");
+                        if ui.button("close").clicked() {
+                            self.stop_recording_gif(device, &rs.queue);
+                        }
+                    }
+                    GifStatus::None => unreachable!(),
                 },
             );
         }
@@ -1146,63 +1331,157 @@ impl App for ObamifyApp {
                 });
         }
 
-        // continuous repaint for animation
-        ctx.request_repaint();
+        let needs_continuous_repaint = self.gui.animate
+            || self.gui.show_progress_modal.is_some()
+            || self.gui.image_dialog_open
+            || !self.gif_recorder.not_recording()
+            || !self.gui.has_obamified_once;
+        if needs_continuous_repaint {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         self.frame_count += 1;
     }
 }
 
 fn prompt_image(
     title: &'static str,
-    app: &mut ObamifyApp,
-    callback: impl FnOnce(String, image::RgbImage, &mut ObamifyApp) + 'static,
+    ctx: &egui::Context,
+    results: Arc<Mutex<VecDeque<ImageImportEvent>>>,
+    purpose: ImageImportPurpose,
 ) {
     #[cfg(target_arch = "wasm32")]
     {
         use wasm_bindgen_futures::spawn_local;
-        let app_ptr: *mut ObamifyApp = app;
+        let ctx = ctx.clone();
 
         spawn_local(async move {
-            if let Some(handle) = rfd::AsyncFileDialog::new()
+            let event = if let Some(handle) = rfd::AsyncFileDialog::new()
                 .set_title(title)
                 .add_filter("image files", &["png", "jpg", "jpeg", "webp"])
                 .pick_file()
                 .await
             {
                 let name = get_default_preset_name(handle.file_name());
-                let data = handle.read().await;
-                match image::load_from_memory(&data) {
-                    Ok(img) => unsafe {
-                        if let Some(app) = app_ptr.as_mut() {
-                            callback(name, img.to_rgb8(), app);
-                        }
-                    },
-                    Err(e) => unsafe {
-                        if let Some(app) = app_ptr.as_mut() {
-                            app.gui.show_error(format!("failed to load image: {}", e));
-                        }
-                    },
+                if handle.inner().size() > MAX_UPLOAD_BYTES as f64 {
+                    ImageImportEvent::Failed(format!(
+                        "Image file is too large (maximum {} MB).",
+                        MAX_UPLOAD_BYTES / (1024 * 1024)
+                    ))
+                } else {
+                    let data = handle.read().await;
+                    match decode_image_bytes(&data) {
+                        Ok(image) => ImageImportEvent::Loaded {
+                            purpose,
+                            name,
+                            image,
+                        },
+                        Err(error) => ImageImportEvent::Failed(error),
+                    }
                 }
-            }
+            } else {
+                ImageImportEvent::Cancelled
+            };
+            results.lock().unwrap().push_back(event);
+            ctx.request_repaint();
         });
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     {
-        if let Some(file) = rfd::FileDialog::new()
+        let event = if let Some(file) = rfd::FileDialog::new()
             .set_title(title)
             .add_filter("image files", &["png", "jpg", "jpeg", "webp"])
             .pick_file()
         {
-            let name =
-                get_default_preset_name(file.file_name().unwrap().to_string_lossy().to_string());
-
-            match image::open(file) {
-                Ok(img) => callback(name, img.to_rgb8(), app),
-                Err(e) => app.gui.show_error(format!("failed to load image: {}", e)),
+            let name = get_default_preset_name(
+                file.file_name()
+                    .map(|name| name.to_string_lossy().into_owned())
+                    .unwrap_or_else(|| "untitled".to_owned()),
+            );
+            match std::fs::metadata(&file) {
+                Ok(metadata) if metadata.len() > MAX_UPLOAD_BYTES as u64 => {
+                    ImageImportEvent::Failed(format!(
+                        "Image file is too large (maximum {} MB).",
+                        MAX_UPLOAD_BYTES / (1024 * 1024)
+                    ))
+                }
+                Ok(_) => match std::fs::read(&file) {
+                    Ok(data) => match decode_image_bytes(&data) {
+                        Ok(image) => ImageImportEvent::Loaded {
+                            purpose,
+                            name,
+                            image,
+                        },
+                        Err(error) => ImageImportEvent::Failed(error),
+                    },
+                    Err(error) => {
+                        ImageImportEvent::Failed(format!("Unable to read image: {error}"))
+                    }
+                },
+                Err(error) => ImageImportEvent::Failed(format!("Unable to inspect image: {error}")),
             }
+        } else {
+            ImageImportEvent::Cancelled
+        };
+        results.lock().unwrap().push_back(event);
+        ctx.request_repaint();
+    }
+}
+
+fn decode_image_bytes(data: &[u8]) -> Result<SourceImg, String> {
+    if data.len() > MAX_UPLOAD_BYTES {
+        return Err(format!(
+            "Image file is too large (maximum {} MB).",
+            MAX_UPLOAD_BYTES / (1024 * 1024)
+        ));
+    }
+    if data.is_empty() {
+        return Err("Image file is empty.".to_owned());
+    }
+
+    let reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|error| format!("Unable to identify image: {error}"))?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|error| format!("Unable to read image dimensions: {error}"))?;
+    let pixel_count = u64::from(width).saturating_mul(u64::from(height));
+    if width == 0 || height == 0 {
+        return Err("Image dimensions cannot be zero.".to_owned());
+    }
+    if width > MAX_UPLOAD_SIDE || height > MAX_UPLOAD_SIDE || pixel_count > MAX_UPLOAD_PIXELS {
+        return Err(format!(
+            "Image dimensions are too large ({width}×{height}); use an image below {MAX_UPLOAD_PIXELS} pixels."
+        ));
+    }
+
+    let reader = image::ImageReader::new(Cursor::new(data))
+        .with_guessed_format()
+        .map_err(|error| format!("Unable to identify image: {error}"))?;
+    let mut decoder = reader
+        .into_decoder()
+        .map_err(|error| format!("Unable to initialize image decoder: {error}"))?;
+    let orientation = decoder
+        .orientation()
+        .unwrap_or(image::metadata::Orientation::NoTransforms);
+    let mut image = image::DynamicImage::from_decoder(decoder)
+        .map_err(|error| format!("Unable to decode image: {error}"))?;
+    image.apply_orientation(orientation);
+
+    // Composite transparency onto white explicitly. Dropping alpha would expose
+    // arbitrary hidden RGB values and produces dark fringes around PNG/WebP art.
+    let rgba = image.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
+    for pixel in rgba.pixels() {
+        let alpha = u16::from(pixel[3]);
+        for channel in &pixel.0[..3] {
+            let blended = (u16::from(*channel) * alpha + 255 * (255 - alpha) + 127) / 255;
+            rgb.push(blended as u8);
         }
     }
+    image::ImageBuffer::from_raw(width, height, rgb)
+        .ok_or_else(|| "Decoded image had an invalid pixel buffer.".to_owned())
 }
 
 fn ensure_reasonable_size(img: SourceImg) -> SourceImg {
@@ -1212,8 +1491,8 @@ fn ensure_reasonable_size(img: SourceImg) -> SourceImg {
         return img;
     }
     let scale = (max_side as f32 / w as f32).min(max_side as f32 / h as f32);
-    let new_w = (w as f32 * scale).round() as u32;
-    let new_h = (h as f32 * scale).round() as u32;
+    let new_w = ((w as f32 * scale).round() as u32).max(1);
+    let new_h = ((h as f32 * scale).round() as u32).max(1);
 
     image::imageops::resize(&img, new_w, new_h, image::imageops::FilterType::Lanczos3)
 }
@@ -1277,52 +1556,60 @@ fn image_crop_gui(
         } else {
             ui.label("Fixed portrait target");
         }
-        // crop sliders
-        ui.vertical(|ui| {
-            let values = *crop_scale;
-            let slider_w = ui.available_width().min(260.0);
+        if allow_change {
+            // Only the uploaded source can be reframed. The portrait target is
+            // intentionally fixed so every transformation uses the same image.
+            ui.vertical(|ui| {
+                let values = *crop_scale;
+                let slider_w = ui.available_width().min(260.0);
 
-            ui.add_sized(
-                [slider_w, 20.0],
-                egui::Slider::new(&mut crop_scale.scale, 1.0..=5.0)
-                    .show_value(false)
-                    .text("Zoom"),
-            );
-            ui.add_sized(
-                [slider_w, 20.0],
-                egui::Slider::new(&mut crop_scale.x, -1.0..=1.0)
-                    .show_value(false)
-                    .text("Horizontal"),
-            );
-            ui.add_sized(
-                [slider_w, 20.0],
-                egui::Slider::new(&mut crop_scale.y, -1.0..=1.0)
-                    .show_value(false)
-                    .text("Vertical"),
-            );
+                ui.add_sized(
+                    [slider_w, 20.0],
+                    egui::Slider::new(&mut crop_scale.scale, 1.0..=5.0)
+                        .show_value(false)
+                        .text("Zoom"),
+                );
+                ui.add_sized(
+                    [slider_w, 20.0],
+                    egui::Slider::new(&mut crop_scale.x, -1.0..=1.0)
+                        .show_value(false)
+                        .text("Horizontal"),
+                );
+                ui.add_sized(
+                    [slider_w, 20.0],
+                    egui::Slider::new(&mut crop_scale.y, -1.0..=1.0)
+                        .show_value(false)
+                        .text("Vertical"),
+                );
 
-            if values != *crop_scale {
-                *cache = None; // force reload
-            }
-        });
+                if values != *crop_scale {
+                    *cache = None; // force reload
+                }
+            });
+        }
     });
 
     open_file_dialog
 }
 
 fn get_default_preset_name(mut n: String) -> String {
-    let mut name = {
-        if let Some(dot) = n.rfind('.') {
-            if dot > 0 {
-                n.truncate(dot);
-            }
+    if let Some(dot) = n.rfind('.') {
+        if dot > 0 {
+            n.truncate(dot);
         }
-        if n.is_empty() {
-            "untitled".to_owned()
-        } else {
-            n
-        }
-    };
+    }
+    normalize_preset_name(&n)
+}
+
+fn normalize_preset_name(n: &str) -> String {
+    let mut name: String = n
+        .trim()
+        .chars()
+        .filter(|character| !character.is_control())
+        .collect();
+    if name.is_empty() {
+        name = "untitled".to_owned();
+    }
     if name.chars().count() > 20 {
         name = name.chars().take(20).collect();
     }

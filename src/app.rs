@@ -9,6 +9,12 @@ pub use crate::app::calculate::worker::worker_entry;
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc;
+#[cfg(target_arch = "wasm32")]
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    rc::Rc,
+};
 use std::{
     num::NonZeroU64,
     sync::{Arc, RwLock},
@@ -20,7 +26,6 @@ use std::sync::atomic::AtomicU32;
 use bytemuck::{Pod, Zeroable};
 use eframe::CreationContext;
 use egui_wgpu::{self, wgpu};
-#[cfg(not(target_arch = "wasm32"))]
 use uuid::Uuid;
 use wgpu::util::DeviceExt;
 
@@ -70,6 +75,12 @@ pub enum GuiMode {
 use crate::app::{calculate::ProgressMsg, morph_sim::Sim, preset::UnprocessedPreset};
 use crate::app::{calculate::util::GenerationSettings, preset::Preset};
 
+#[cfg(not(target_arch = "wasm32"))]
+struct NativeWorkerEvent {
+    job_id: Uuid,
+    msg: ProgressMsg,
+}
+
 #[cfg(target_arch = "wasm32")]
 use wasm_bindgen::closure::Closure;
 #[cfg(target_arch = "wasm32")]
@@ -84,15 +95,42 @@ pub struct ObamifyApp {
     seed_count: u32,
 
     #[cfg(not(target_arch = "wasm32"))]
-    progress_tx: mpsc::SyncSender<ProgressMsg>,
+    progress_tx: mpsc::Sender<NativeWorkerEvent>,
     #[cfg(not(target_arch = "wasm32"))]
-    progress_rx: mpsc::Receiver<ProgressMsg>,
+    progress_rx: mpsc::Receiver<NativeWorkerEvent>,
+    #[cfg(not(target_arch = "wasm32"))]
+    active_native_job: Option<Uuid>,
+    #[cfg(not(target_arch = "wasm32"))]
+    drawing_tx: mpsc::SyncSender<calculate::drawing_process::DrawingWorkerEvent>,
+    #[cfg(not(target_arch = "wasm32"))]
+    drawing_rx: mpsc::Receiver<calculate::drawing_process::DrawingWorkerEvent>,
 
     #[cfg(target_arch = "wasm32")]
     worker: Option<Worker>,
 
     #[cfg(target_arch = "wasm32")]
-    inbox: Vec<ProgressMsg>,
+    worker_ready: Rc<Cell<bool>>,
+
+    #[cfg(target_arch = "wasm32")]
+    worker_started_at_ms: Option<f64>,
+
+    #[cfg(target_arch = "wasm32")]
+    inbox: Rc<RefCell<VecDeque<calculate::worker::WorkerEvent>>>,
+
+    #[cfg(target_arch = "wasm32")]
+    pending_worker_req: Option<calculate::worker::WorkerReq>,
+
+    #[cfg(target_arch = "wasm32")]
+    active_worker_job: Option<Uuid>,
+
+    #[cfg(target_arch = "wasm32")]
+    worker_onerror: Option<Closure<dyn FnMut(JsValue)>>,
+
+    #[cfg(target_arch = "wasm32")]
+    worker_onmessageerror: Option<Closure<dyn FnMut(JsValue)>>,
+
+    #[cfg(target_arch = "wasm32")]
+    worker_onmessage: Option<Closure<dyn FnMut(web_sys::MessageEvent)>>,
 
     gif_recorder: gif_recorder::GifRecorder,
     sim: Sim,
@@ -260,12 +298,20 @@ impl ObamifyApp {
         let size = (DEFAULT_RESOLUTION, DEFAULT_RESOLUTION);
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
-        // get all folders in ../presets
-        let presets: Vec<Preset> = if let Some(storage) = cc.storage {
-            eframe::get_value(storage, "portraitify_presets_v1").unwrap_or(get_presets())
-        } else {
-            get_presets()
-        };
+        // Treat browser storage as untrusted input. A truncated image or an
+        // invalid assignment used to panic before the UI could offer recovery.
+        let stored_presets: Option<Vec<Preset>> = cc
+            .storage
+            .and_then(|storage| eframe::get_value(storage, "portraitify_presets_v1"));
+        let presets = stored_presets
+            .map(|stored| {
+                stored
+                    .into_iter()
+                    .filter(|preset| preset.validate().is_ok())
+                    .collect::<Vec<_>>()
+            })
+            .filter(|stored| !stored.is_empty())
+            .unwrap_or_else(get_presets);
 
         let has_obamified_once = if let Some(storage) = cc.storage {
             eframe::get_value::<bool>(storage, "has_portraitified_once_v1").unwrap_or(false)
@@ -278,7 +324,10 @@ impl ObamifyApp {
 
         #[cfg(not(target_arch = "wasm32"))]
         let random_preset = frand::Rand::with_seed(
-            std::time::SystemTime::now().elapsed().unwrap().as_nanos() as u64,
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as u64,
         )
         .gen_range(0..presets.len() as u64) as usize;
 
@@ -746,7 +795,10 @@ impl ObamifyApp {
         });
 
         #[cfg(not(target_arch = "wasm32"))]
-        let (progress_tx, progress_rx) = mpsc::sync_channel::<ProgressMsg>(1);
+        let (progress_tx, progress_rx) = mpsc::channel::<NativeWorkerEvent>();
+        #[cfg(not(target_arch = "wasm32"))]
+        let (drawing_tx, drawing_rx) =
+            mpsc::sync_channel::<calculate::drawing_process::DrawingWorkerEvent>(1);
 
         Self {
             size,
@@ -794,6 +846,12 @@ impl ObamifyApp {
             progress_tx,
             #[cfg(not(target_arch = "wasm32"))]
             progress_rx,
+            #[cfg(not(target_arch = "wasm32"))]
+            active_native_job: None,
+            #[cfg(not(target_arch = "wasm32"))]
+            drawing_tx,
+            #[cfg(not(target_arch = "wasm32"))]
+            drawing_rx,
             gif_recorder: gif_recorder::GifRecorder::new(),
             preview_image: None,
             #[cfg(not(target_arch = "wasm32"))]
@@ -805,7 +863,21 @@ impl ObamifyApp {
             #[cfg(target_arch = "wasm32")]
             worker: None,
             #[cfg(target_arch = "wasm32")]
-            inbox: Vec::new(),
+            worker_ready: Rc::new(Cell::new(false)),
+            #[cfg(target_arch = "wasm32")]
+            worker_started_at_ms: None,
+            #[cfg(target_arch = "wasm32")]
+            inbox: Rc::new(RefCell::new(VecDeque::new())),
+            #[cfg(target_arch = "wasm32")]
+            pending_worker_req: None,
+            #[cfg(target_arch = "wasm32")]
+            active_worker_job: None,
+            #[cfg(target_arch = "wasm32")]
+            worker_onerror: None,
+            #[cfg(target_arch = "wasm32")]
+            worker_onmessageerror: None,
+            #[cfg(target_arch = "wasm32")]
+            worker_onmessage: None,
             current_filter_mode: wgpu::FilterMode::Linear,
 
             reverse: false,
@@ -815,17 +887,134 @@ impl ObamifyApp {
     pub fn get_latest_msg(&mut self) -> Option<ProgressMsg> {
         #[cfg(target_arch = "wasm32")]
         {
-            self.inbox.pop()
+            loop {
+                let event = self.inbox.borrow_mut().pop_front()?;
+                match event {
+                    calculate::worker::WorkerEvent::Ready => {
+                        self.worker_ready.set(true);
+                    }
+                    calculate::worker::WorkerEvent::Message { job_id, msg } => {
+                        if self.active_worker_job == Some(job_id) {
+                            if matches!(
+                                &msg,
+                                ProgressMsg::Done(_)
+                                    | ProgressMsg::Error(_)
+                                    | ProgressMsg::Cancelled
+                            ) {
+                                self.active_worker_job = None;
+                                self.pending_worker_req = None;
+                            }
+                            return Some(msg);
+                        }
+                    }
+                    calculate::worker::WorkerEvent::Fatal(message) => {
+                        self.terminate_worker();
+                        return Some(ProgressMsg::Error(message));
+                    }
+                }
+            }
         }
         #[cfg(not(target_arch = "wasm32"))]
         {
-            match self.progress_rx.try_recv() {
-                Ok(msg) => Some(msg),
-                Err(mpsc::TryRecvError::Empty) => None,
-                Err(mpsc::TryRecvError::Disconnected) => {
-                    eprintln!("progress channel disconnected");
-                    None
+            loop {
+                match self.progress_rx.try_recv() {
+                    Ok(event) => {
+                        if self.active_native_job != Some(event.job_id) {
+                            continue;
+                        }
+                        if matches!(
+                            &event.msg,
+                            ProgressMsg::Done(_) | ProgressMsg::Error(_) | ProgressMsg::Cancelled
+                        ) {
+                            self.active_native_job = None;
+                        }
+                        return Some(event.msg);
+                    }
+                    Err(mpsc::TryRecvError::Empty) => return None,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        eprintln!("progress channel disconnected");
+                        return None;
+                    }
                 }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    fn get_latest_drawing_msg(&mut self) -> Option<ProgressMsg> {
+        loop {
+            match self.drawing_rx.try_recv() {
+                Ok(event) => {
+                    let current_id = self
+                        .current_drawing_id
+                        .load(std::sync::atomic::Ordering::SeqCst);
+                    if event.drawing_id != current_id {
+                        continue;
+                    }
+                    return Some(event.msg);
+                }
+                Err(mpsc::TryRecvError::Empty) => return None,
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    eprintln!("drawing channel disconnected");
+                    return None;
+                }
+            }
+        }
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn terminate_worker(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            worker.set_onmessage(None);
+            worker.set_onerror(None);
+            worker.set_onmessageerror(None);
+            worker.terminate();
+        }
+        self.worker_ready.set(false);
+        self.worker_started_at_ms = None;
+        self.worker_onerror = None;
+        self.worker_onmessageerror = None;
+        self.worker_onmessage = None;
+        self.pending_worker_req = None;
+        self.active_worker_job = None;
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn cancel_worker_job(&mut self) {
+        self.terminate_worker();
+        self.inbox.borrow_mut().clear();
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn send_pending_worker_req(&mut self) {
+        if !self.worker_ready.get() {
+            return;
+        }
+
+        let Some(request) = self.pending_worker_req.take() else {
+            return;
+        };
+        let Some(worker) = self.worker.as_ref() else {
+            self.pending_worker_req = Some(request);
+            return;
+        };
+
+        match serde_wasm_bindgen::to_value(&request) {
+            Ok(value) => {
+                if let Err(error) = worker.post_message(&value) {
+                    self.inbox
+                        .borrow_mut()
+                        .push_back(calculate::worker::WorkerEvent::Fatal(format!(
+                            "Unable to start background processing: {error:?}"
+                        )));
+                }
+            }
+            Err(error) => {
+                self.inbox
+                    .borrow_mut()
+                    .push_back(calculate::worker::WorkerEvent::Fatal(format!(
+                        "Unable to encode background request: {error}"
+                    )));
             }
         }
     }
@@ -833,68 +1022,110 @@ impl ObamifyApp {
     #[cfg(target_arch = "wasm32")]
     fn ensure_worker(&mut self, _ctx: &egui::Context) {
         if self.worker.is_some() {
+            if self.worker_ready.get() {
+                self.send_pending_worker_req();
+                return;
+            }
+
+            if let Some(started_at) = self.worker_started_at_ms {
+                if js_sys::Date::now() - started_at > 15_000.0 {
+                    self.inbox
+                        .borrow_mut()
+                        .push_back(calculate::worker::WorkerEvent::Fatal(
+                            "Background processor did not become ready within 15 seconds."
+                                .to_owned(),
+                        ));
+                    self.worker_started_at_ms = None;
+                }
+            }
             return;
         }
 
-        fn find_bundled_script(text: &str) -> Option<String> {
-            let start = text.find("obamify-")?;
-            let rest = &text[start..];
-            let end = rest.find(".js")?;
-            Some(format!("./{}", &rest[..end + 3]))
+        if self
+            .inbox
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, calculate::worker::WorkerEvent::Fatal(_)))
+        {
+            return;
         }
 
-        let worker = {
-            let wasm_script_src = js_sys::Reflect::get(
-                &js_sys::global(),
-                &JsValue::from_str("__wbindgen_script_src"),
-            )
-            .ok()
-            .and_then(|v| v.as_string())
-            .and_then(|url| url.rsplit('/').next().map(|s| format!("./{}", s)))
-            .unwrap_or_else(|| {
-                // Trunk emits an inline module script containing the hashed bundle name.
-                // Read that script directly; relying on a JavaScript stack trace is not
-                // reliable in optimized GitHub Pages builds.
-                if let Some(document) = web_sys::window().and_then(|w| w.document()) {
-                    let scripts = document.scripts();
-                    for index in 0..scripts.length() {
-                        if let Some(element) = scripts.item(index) {
-                            if let Ok(script) = element.dyn_into::<web_sys::HtmlScriptElement>() {
-                                if let Some(found) = find_bundled_script(&script.src()) {
-                                    return found;
-                                }
-                                if let Ok(text) = script.text() {
-                                    if let Some(found) = find_bundled_script(&text) {
-                                        return found;
-                                    }
-                                }
-                            }
-                        }
+        fn valid_bundle_candidate(candidate: &str) -> Option<String> {
+            let candidate = candidate.trim();
+            let path = candidate.split(['?', '#']).next()?;
+            let filename = path.rsplit('/').next()?;
+            let valid = filename
+                .strip_prefix("obamify-")
+                .and_then(|rest| rest.strip_suffix(".js"))
+                .is_some_and(|hash| !hash.is_empty());
+            valid.then(|| candidate.to_owned())
+        }
+
+        fn find_bundled_script(text: &str) -> Option<String> {
+            text.split(&['\'', '"'][..])
+                .find_map(valid_bundle_candidate)
+        }
+
+        let wasm_script_src = {
+            let mut found = None;
+            if let Some(document) = web_sys::window().and_then(|window| window.document()) {
+                let scripts = document.scripts();
+                for index in 0..scripts.length() {
+                    let Some(element) = scripts.item(index) else {
+                        continue;
+                    };
+                    let Ok(script) = element.dyn_into::<web_sys::HtmlScriptElement>() else {
+                        continue;
+                    };
+                    found = valid_bundle_candidate(&script.src()).or_else(|| {
+                        script
+                            .text()
+                            .ok()
+                            .and_then(|text| find_bundled_script(&text))
+                    });
+                    if found.is_some() {
+                        break;
                     }
                 }
+            }
+            found
+        };
 
-                // Fallback: parse from Error stack trace to find obamify-{hash}.js
-                let error = js_sys::Error::new("stack trace");
-                if let Ok(stack_val) = js_sys::Reflect::get(&error, &JsValue::from_str("stack")) {
-                    if let Some(stack) = stack_val.as_string() {
-                        if let Some(found) = find_bundled_script(&stack) {
-                            return found;
-                        }
-                    }
-                }
+        let Some(wasm_script_src) = wasm_script_src else {
+            self.inbox.borrow_mut().push_back(
+                calculate::worker::WorkerEvent::Fatal(
+                    "Unable to locate the generated application module. Refresh the page to load the latest deployment."
+                        .to_owned(),
+                ),
+            );
+            return;
+        };
 
-                String::from("./obamify.js")
-            });
+        let encoded_script = js_sys::encode_uri_component(&wasm_script_src)
+            .as_string()
+            .unwrap_or(wasm_script_src);
+        let worker_url = format!("./worker.js?script={encoded_script}");
+        let options = WorkerOptions::new();
+        options.set_type(WorkerType::Module);
 
-            // Use worker.js and pass the script name as a query parameter
-            let worker_url = format!("./worker.js?script={}", wasm_script_src);
+        let worker = match Worker::new_with_options(&worker_url, &options) {
+            Ok(worker) => worker,
+            Err(error) => {
+                self.inbox
+                    .borrow_mut()
+                    .push_back(calculate::worker::WorkerEvent::Fatal(format!(
+                        "Unable to create background processor: {error:?}"
+                    )));
+                return;
+            }
+        };
 
-            let opts = WorkerOptions::new();
-            opts.set_type(WorkerType::Module);
-            let w = Worker::new_with_options(&worker_url, &opts).expect("worker");
+        self.worker_ready.set(false);
+        self.worker_started_at_ms = Some(js_sys::Date::now());
 
-            // ---- onerror: may be ErrorEvent OR a generic Event/JsValue ----
-            let inbox_ptr: *mut Vec<ProgressMsg> = &mut self.inbox;
+        {
+            let inbox = Rc::clone(&self.inbox);
+            let ready = Rc::clone(&self.worker_ready);
             let onerror = Closure::wrap(Box::new(move |e: JsValue| {
                 let message = if let Some(err) = e.dyn_ref::<web_sys::ErrorEvent>() {
                     err.message()
@@ -903,67 +1134,55 @@ impl ObamifyApp {
                 } else {
                     "unknown worker initialization error".to_owned()
                 };
-
-                unsafe {
-                    (*inbox_ptr).push(ProgressMsg::Error(format!(
+                ready.set(false);
+                inbox
+                    .borrow_mut()
+                    .push_back(calculate::worker::WorkerEvent::Fatal(format!(
                         "Background processor failed to start: {message}"
                     )));
-                }
-
-                if let Some(err) = e.dyn_ref::<web_sys::ErrorEvent>() {
-                    // Safe: has .message()
-                    web_sys::console::error_2(&"worker error:".into(), &err.message().into());
-                    // (Optional) filenames/lineno may be empty on module workers:
-                    // web_sys::console::error_3(&"at".into(), &err.filename().into(), &err.lineno().into());
-                } else if let Some(ev) = e.dyn_ref::<web_sys::Event>() {
-                    // No message property
-                    let ty = ev.type_();
-                    web_sys::console::error_2(&"worker error (generic Event):".into(), &ty.into());
-                } else {
-                    // Something else (could even be undefined/null)
-                    web_sys::console::error_1(&JsValue::from_str(&format!(
-                        "worker error (unknown): {:?}",
-                        js_sys::JSON::stringify(&e).ok()
-                    )));
-                }
             }) as Box<dyn FnMut(JsValue)>);
-            // set_onerror takes a Function; unchecked_ref is fine here
-            w.set_onerror(Some(onerror.as_ref().unchecked_ref()));
-            onerror.forget();
+            worker.set_onerror(Some(onerror.as_ref().unchecked_ref()));
+            self.worker_onerror = Some(onerror);
+        }
 
-            // ---- onmessageerror: data failed to deserialize ----
-            let onmsgerr = Closure::wrap(Box::new(move |e: JsValue| {
-                if let Some(me) = e.dyn_ref::<web_sys::MessageEvent>() {
-                    web_sys::console::error_2(&"worker messageerror; data:".into(), &me.data());
-                } else {
-                    web_sys::console::error_1(&"worker messageerror (unknown payload)".into());
-                }
-            }) as Box<dyn FnMut(JsValue)>);
-            // Older web-sys may not have set_onmessageerror; ignore if missing
-            #[allow(unused_must_use)]
-            {
-                w.set_onmessageerror(Some(onmsgerr.as_ref().unchecked_ref()));
-            }
-            onmsgerr.forget();
-
-            w
-        };
-
-        //web_sys::console::log_1(&"worker created".into());
-
-        // Receive progress messages
         {
-            let inbox_ptr: *mut Vec<ProgressMsg> = &mut self.inbox;
+            let inbox = Rc::clone(&self.inbox);
+            let ready = Rc::clone(&self.worker_ready);
+            let onmsgerr = Closure::wrap(Box::new(move |e: JsValue| {
+                ready.set(false);
+                let detail = e
+                    .dyn_ref::<web_sys::Event>()
+                    .map(|event| event.type_())
+                    .unwrap_or_else(|| "unknown message event".to_owned());
+                inbox
+                    .borrow_mut()
+                    .push_back(calculate::worker::WorkerEvent::Fatal(format!(
+                        "Background message could not be decoded: {detail}"
+                    )));
+            }) as Box<dyn FnMut(JsValue)>);
+            worker.set_onmessageerror(Some(onmsgerr.as_ref().unchecked_ref()));
+            self.worker_onmessageerror = Some(onmsgerr);
+        }
+
+        {
+            let inbox = Rc::clone(&self.inbox);
+            let ready = Rc::clone(&self.worker_ready);
             let onmessage = Closure::wrap(Box::new(move |e: web_sys::MessageEvent| {
-                if let Ok(msg) = serde_wasm_bindgen::from_value::<ProgressMsg>(e.data()) {
-                    // SAFETY: single-threaded; worker posts to main thread
-                    unsafe {
-                        (*inbox_ptr).push(msg);
+                match serde_wasm_bindgen::from_value::<calculate::worker::WorkerEvent>(e.data()) {
+                    Ok(calculate::worker::WorkerEvent::Ready) => ready.set(true),
+                    Ok(event) => inbox.borrow_mut().push_back(event),
+                    Err(error) => {
+                        ready.set(false);
+                        inbox
+                            .borrow_mut()
+                            .push_back(calculate::worker::WorkerEvent::Fatal(format!(
+                                "Background processor returned an invalid message: {error}"
+                            )));
                     }
                 }
             }) as Box<dyn FnMut(_)>);
             worker.set_onmessage(Some(onmessage.as_ref().unchecked_ref()));
-            onmessage.forget();
+            self.worker_onmessage = Some(onmessage);
         }
 
         self.worker = Some(worker);
@@ -971,14 +1190,23 @@ impl ObamifyApp {
 
     #[cfg(target_arch = "wasm32")]
     fn start_job(&mut self, src: UnprocessedPreset, settings: GenerationSettings) {
-        if let Some(w) = &self.worker {
-            let req = calculate::worker::WorkerReq::Process {
-                source: src,
-                settings,
-            };
-            let v = serde_wasm_bindgen::to_value(&req).unwrap();
-            w.post_message(&v).unwrap();
+        let worker_had_failed = self
+            .inbox
+            .borrow()
+            .iter()
+            .any(|event| matches!(event, calculate::worker::WorkerEvent::Fatal(_)));
+        if worker_had_failed {
+            self.terminate_worker();
         }
+        let job_id = settings.id;
+        self.active_worker_job = Some(job_id);
+        self.inbox.borrow_mut().clear();
+        self.pending_worker_req = Some(calculate::worker::WorkerReq::Process {
+            job_id,
+            source: src,
+            settings,
+        });
+        self.send_pending_worker_req();
     }
 
     fn make_ids_texture(
@@ -1695,7 +1923,7 @@ impl ObamifyApp {
         // Keep the buffer for backward compatibility if needed elsewhere
         self.color_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("colors"),
-            contents: bytemuck::cast_slice(&*colors),
+            contents: bytemuck::cast_slice(&colors),
             usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         });
     }
@@ -1758,9 +1986,10 @@ impl ObamifyApp {
 
         self.current_drawing_id
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        while self.drawing_rx.try_recv().is_ok() {}
 
         std::thread::spawn({
-            let tx = self.progress_tx.clone();
+            let tx = self.drawing_tx.clone();
             let colors = Arc::clone(&self.colors);
             let pixel_data = Arc::clone(&self.pixeldata);
             let frame_count = self.frame_count;
@@ -1781,7 +2010,11 @@ impl ObamifyApp {
                 match result {
                     Ok(()) => {}
                     Err(err) => {
-                        tx.send(ProgressMsg::Error(err.to_string())).ok();
+                        tx.try_send(calculate::drawing_process::DrawingWorkerEvent {
+                            drawing_id: my_id,
+                            msg: ProgressMsg::Error(err.to_string()),
+                        })
+                        .ok();
                     }
                 }
             }
@@ -1852,3 +2085,10 @@ macro_rules! include_presets {
 }
 
 include_presets! { "portrait" }
+
+#[cfg(target_arch = "wasm32")]
+impl Drop for ObamifyApp {
+    fn drop(&mut self) {
+        self.terminate_worker();
+    }
+}

@@ -26,8 +26,20 @@ Advanced settings:
 ## Running the web version locally
 1. Install [Rust](https://www.rust-lang.org/tools/install)
 2. Install the required target with `rustup target add wasm32-unknown-unknown`
-3. Install Trunk with `cargo install --locked trunk`
+3. Install the same Trunk version used by CI with `cargo install --locked trunk --version 0.21.14`
 4. Run `trunk serve --release --open`
+
+## Publishing the website
+
+Pushing `main` automatically builds and publishes the GitHub Pages site. The
+generated JavaScript and WebAssembly use matching hashed filenames, while
+`worker.js` discovers that generated pair at runtime, so the site also works
+when it is hosted below a repository path such as `/obamify-main/`.
+
+Cloudflare Pages deployment is disabled by default to avoid failed workflow
+runs when no Cloudflare credentials are configured. To enable it, add the
+`CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID` repository secrets and set
+the repository variable `CLOUDFLARE_PAGES_ENABLED` to `true`.
 
 # Credits
 

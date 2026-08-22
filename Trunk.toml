@@ -1,4 +1,5 @@
 [build]
-# The module worker loads obamify.js by name. Stable filenames keep that
-# worker path valid on GitHub Pages and other subdirectory deployments.
-filehash = false
+# Hash the generated JavaScript and WebAssembly so a new deployment cannot be
+# mixed with stale browser/CDN assets. The stable worker.js entry point receives
+# the generated module URL from the application at runtime.
+filehash = true

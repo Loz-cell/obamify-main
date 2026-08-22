@@ -2,9 +2,13 @@ on: [push, pull_request, workflow_dispatch]
 
 name: CI
 
-# env:
-#   RUSTFLAGS: -D warnings
-#   RUSTDOCFLAGS: -D warnings
+concurrency:
+    group: ci-${{ github.workflow }}-${{ github.ref }}
+    cancel-in-progress: true
+
+env:
+    TRUNK_VERSION: "0.21.14"
+    TRUNK_SHA256: "f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b"
 
 jobs:
     check:
@@ -12,94 +16,179 @@ jobs:
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
-            - uses: actions-rs/toolchain@v1
-              with:
-                  profile: minimal
-                  toolchain: stable
-                  override: true
-            - uses: actions-rs/cargo@v1
-              with:
-                  command: check
-                  args: --all-features
+            - uses: dtolnay/rust-toolchain@1.85.0
+            - run: cargo check --all-features
 
     check_wasm:
         name: Check wasm32
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
-            - uses: actions-rs/toolchain@v1
+            - uses: dtolnay/rust-toolchain@1.85.0
               with:
-                  profile: minimal
-                  toolchain: stable
-                  target: wasm32-unknown-unknown
-                  override: true
-            - uses: actions-rs/cargo@v1
-              with:
-                  command: check
-                  args: --all-features --lib --target wasm32-unknown-unknown
+                  targets: wasm32-unknown-unknown
+            - run: cargo check --all-features --lib --target wasm32-unknown-unknown
 
     test:
         name: Test Suite
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
-            - uses: actions-rs/toolchain@v1
-              with:
-                  profile: minimal
-                  toolchain: stable
-                  override: true
+            - uses: dtolnay/rust-toolchain@1.85.0
             - run: sudo apt-get install libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev libssl-dev
-            - uses: actions-rs/cargo@v1
-              with:
-                  command: test
-                  args: --lib
+            - run: cargo test --lib
 
     fmt:
         name: Rustfmt
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
-            - uses: actions-rs/toolchain@v1
+            - uses: dtolnay/rust-toolchain@1.85.0
               with:
-                  profile: minimal
-                  toolchain: stable
-                  override: true
                   components: rustfmt
-            - uses: actions-rs/cargo@v1
-              with:
-                  command: fmt
-                  args: --all -- --check
+            - run: cargo fmt --all -- --check
 
     clippy:
         name: Clippy
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
-            - uses: actions-rs/toolchain@v1
+            - uses: dtolnay/rust-toolchain@1.85.0
               with:
-                  profile: minimal
-                  toolchain: stable
-                  override: true
                   components: clippy
-            - uses: actions-rs/cargo@v1
-              with:
-                  command: clippy
+            - run: cargo clippy
 
     trunk:
         name: trunk
         runs-on: ubuntu-latest
         steps:
             - uses: actions/checkout@v4
-            - uses: actions-rs/toolchain@v1
+            - uses: dtolnay/rust-toolchain@1.85.0
               with:
-                  profile: minimal
-                  toolchain: 1.85.0
-                  target: wasm32-unknown-unknown
-                  override: true
+                  targets: wasm32-unknown-unknown
             - name: Download and install Trunk binary
-              run: wget -qO- https://github.com/thedodd/trunk/releases/latest/download/trunk-x86_64-unknown-linux-gnu.tar.gz | tar -xzf-
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  base="https://github.com/trunk-rs/trunk/releases/download/v${TRUNK_VERSION}"
+                  curl --fail --location --silent --show-error --output trunk.tar.gz \
+                    "${base}/trunk-x86_64-unknown-linux-gnu.tar.gz"
+                  echo "${TRUNK_SHA256}  trunk.tar.gz" | sha256sum --check -
+                  tar --extract --gzip --file trunk.tar.gz trunk
+                  ./trunk --version
             - name: Build
-              run: ./trunk build
+              run: ./trunk build --release --public-url /test-subdirectory/
+            - name: Smoke test generated web assets and worker paths
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  python3 - <<'PY'
+                  import json
+                  import re
+                  from pathlib import Path
+                  from urllib.parse import urljoin
+
+                  dist = Path("dist")
+                  required = ["index.html", "worker.js", "sw.js", "manifest.json"]
+                  missing = [name for name in required if not (dist / name).is_file()]
+                  assert not missing, f"missing generated assets: {missing}"
+
+                  modules = [
+                      path for path in dist.glob("obamify-*.js")
+                      if not path.name.endswith("_bg.js")
+                  ]
+                  assert len(modules) == 1, f"expected one hashed JS module, found: {modules}"
+                  module = modules[0]
+                  assert re.fullmatch(r"obamify-[A-Za-z0-9_-]+\.js", module.name), module.name
+                  assert not (dist / "obamify.js").exists(), "file hashing is unexpectedly disabled"
+
+                  wasm = dist / f"{module.stem}_bg.wasm"
+                  assert wasm.is_file(), f"missing matching WASM asset: {wasm.name}"
+
+                  html = (dist / "index.html").read_text(encoding="utf-8")
+                  assert module.name in html, "index.html does not reference the generated JS module"
+                  assert "/test-subdirectory/" in html, "public URL was not applied"
+
+                  worker = (dist / "worker.js").read_text(encoding="utf-8")
+                  assert "URLSearchParams" in worker and "script" in worker
+                  assert "_bg.wasm" in worker
+                  assert "/obamify-main/obamify" not in worker, "worker contains a deployment-specific path"
+
+                  worker_url = "https://example.test/test-subdirectory/worker.js"
+                  script_url = urljoin(worker_url, f"./{module.name}")
+                  assert script_url == f"https://example.test/test-subdirectory/{module.name}"
+                  assert script_url.removesuffix(".js") + "_bg.wasm" == (
+                      f"https://example.test/test-subdirectory/{wasm.name}"
+                  )
+
+                  manifest = json.loads((dist / "manifest.json").read_text(encoding="utf-8"))
+                  assert manifest["id"].startswith("./")
+                  assert manifest["start_url"].startswith("./")
+                  assert manifest["scope"].startswith("./")
+                  print(f"asset smoke test passed: {module.name} + {wasm.name}")
+                  PY
+            - name: Browser smoke test worker startup
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  module="$(basename "$(find dist -maxdepth 1 -type f -name 'obamify-*.js' | head -n 1)")"
+                  site_root="${RUNNER_TEMP}/portraitify-smoke-site"
+                  app_root="${site_root}/test-subdirectory"
+                  mkdir -p "$app_root"
+                  cp -a dist/. "$app_root/"
+
+                  MODULE_NAME="$module" APP_ROOT="$app_root" python3 - <<'PY'
+                  import json
+                  import os
+                  from pathlib import Path
+
+                  module = os.environ["MODULE_NAME"]
+                  app_root = Path(os.environ["APP_ROOT"])
+                  module_literal = json.dumps(f"./{module}")
+                  page = f"""<!doctype html>
+                  <html><body data-result="pending">
+                  <script type="module">
+                  const worker = new Worker(
+                    './worker.js?script=' + encodeURIComponent({module_literal}),
+                    {{ type: 'module' }},
+                  );
+                  const timer = setTimeout(() => {{
+                    document.body.dataset.result = 'timeout';
+                    worker.terminate();
+                  }}, 10000);
+                  worker.onmessage = () => {{
+                    clearTimeout(timer);
+                    document.body.dataset.result = 'ready';
+                    worker.terminate();
+                  }};
+                  worker.onerror = (event) => {{
+                    clearTimeout(timer);
+                    document.body.dataset.result = 'error';
+                    document.body.textContent = event.message || 'worker startup failed';
+                  }};
+                  </script></body></html>"""
+                  (app_root / "worker-smoke.html").write_text(page, encoding="utf-8")
+                  PY
+
+                  python3 -m http.server 8123 --bind 127.0.0.1 --directory "$site_root" \
+                    >"${RUNNER_TEMP}/portraitify-http.log" 2>&1 &
+                  server_pid=$!
+                  trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+                  for _ in {1..20}; do
+                    curl --fail --silent http://127.0.0.1:8123/test-subdirectory/worker-smoke.html \
+                      >/dev/null && break
+                    sleep 0.25
+                  done
+
+                  timeout 30s google-chrome --headless=new --no-sandbox --disable-gpu \
+                    --virtual-time-budget=15000 --dump-dom \
+                    http://127.0.0.1:8123/test-subdirectory/worker-smoke.html \
+                    >"${RUNNER_TEMP}/portraitify-worker-smoke.html"
+                  grep -q 'data-result="ready"' "${RUNNER_TEMP}/portraitify-worker-smoke.html" || {
+                    cat "${RUNNER_TEMP}/portraitify-worker-smoke.html"
+                    cat "${RUNNER_TEMP}/portraitify-http.log"
+                    exit 1
+                  }
 
     build:
         runs-on: ${{ matrix.os }}
@@ -107,38 +196,18 @@ jobs:
             fail-fast: false
             matrix:
                 include:
-                    - os: macos-latest
-                      TARGET: aarch64-apple-darwin
-
-                    - os: macos-latest
-                      TARGET: x86_64-apple-darwin
-
                     - os: ubuntu-latest
-                      TARGET: arm-unknown-linux-musleabihf
+                      target: x86_64-unknown-linux-gnu
 
-                    - os: ubuntu-latest
-                      TARGET: armv7-unknown-linux-musleabihf
-
-                    - os: ubuntu-latest
-                      TARGET: x86_64-unknown-linux-musl
+                    - os: macos-14
+                      target: aarch64-apple-darwin
 
                     - os: windows-latest
-                      TARGET: x86_64-pc-windows-msvc
-                      EXTENSION: .exe
+                      target: x86_64-pc-windows-msvc
 
         steps:
-            - name: Building ${{ matrix.TARGET }}
-              run: echo "${{ matrix.TARGET }}"
-
-            - uses: actions/checkout@master
-            - uses: actions-rs/toolchain@v1.0.1
+            - uses: actions/checkout@v4
+            - uses: dtolnay/rust-toolchain@1.85.0
               with:
-                  toolchain: stable
-                  target: ${{ matrix.TARGET }}
-                  override: true
-
-            - uses: actions-rs/cargo@v1
-              with:
-                  use-cross: true
-                  command: build
-                  args: --verbose --release --target=${{ matrix.TARGET }}
+                  targets: ${{ matrix.target }}
+            - run: cargo build --verbose --release --target ${{ matrix.target }}

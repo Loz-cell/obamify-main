@@ -6,6 +6,7 @@ use serde::Serialize;
 use uuid::Uuid;
 
 use std::error::Error;
+use std::io::{Error as IoError, ErrorKind};
 
 // pub(crate) fn save_result(
 //     target: image::SourceImg,
@@ -56,6 +57,7 @@ pub(crate) fn get_images(
     source: SourceImg,
     settings: &GenerationSettings,
 ) -> Result<(Vec<(u8, u8, u8)>, Vec<(u8, u8, u8)>, Vec<i64>), Box<dyn Error>> {
+    validate_sidelen(settings.sidelen)?;
     let source = settings.source_crop_scale.apply(&source, settings.sidelen);
     let source_pixels = source
         .pixels()
@@ -67,8 +69,87 @@ pub(crate) fn get_images(
         .pixels()
         .map(|p| (p[0], p[1], p[2]))
         .collect::<Vec<_>>();
-    assert_eq!(source_pixels.len(), target_pixels.len());
+    if source_pixels.len() != target_pixels.len() || weights.len() != target_pixels.len() {
+        return Err(IoError::new(
+            ErrorKind::InvalidData,
+            "source, target, and weight image dimensions do not match",
+        )
+        .into());
+    }
     Ok((source_pixels, target_pixels, weights))
+}
+
+/// Decode the raw image representation used by presets without relying on type
+/// inference or `unwrap`. Older drawing presets stored RGBA bytes while normal
+/// presets store RGB, so accepting both formats also keeps those presets usable.
+pub(crate) fn rgb_image_from_raw(
+    width: u32,
+    height: u32,
+    data: Vec<u8>,
+) -> Result<SourceImg, Box<dyn Error>> {
+    if width == 0 || height == 0 {
+        return Err(
+            IoError::new(ErrorKind::InvalidInput, "image dimensions must be non-zero").into(),
+        );
+    }
+
+    let pixels = (width as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "image dimensions are too large"))?;
+    let rgb_len = pixels
+        .checked_mul(3)
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "RGB image is too large"))?;
+    let rgba_len = pixels
+        .checked_mul(4)
+        .ok_or_else(|| IoError::new(ErrorKind::InvalidInput, "RGBA image is too large"))?;
+
+    if data.len() == rgb_len {
+        return image::ImageBuffer::from_raw(width, height, data).ok_or_else(|| {
+            IoError::new(ErrorKind::InvalidData, "invalid RGB image buffer").into()
+        });
+    }
+    if data.len() == rgba_len {
+        let rgba = image::RgbaImage::from_raw(width, height, data)
+            .ok_or_else(|| IoError::new(ErrorKind::InvalidData, "invalid RGBA image buffer"))?;
+        return Ok(image::DynamicImage::ImageRgba8(rgba).to_rgb8());
+    }
+
+    Err(IoError::new(
+        ErrorKind::InvalidData,
+        format!(
+            "invalid image byte length: expected {rgb_len} RGB or {rgba_len} RGBA bytes, got {}",
+            data.len()
+        ),
+    )
+    .into())
+}
+
+pub(crate) fn validate_sidelen(sidelen: u32) -> Result<(), Box<dyn Error>> {
+    // Coordinates are currently stored as u16/i16 in the matching algorithms.
+    // A conservative upper bound also prevents malformed persisted settings from
+    // allocating unexpectedly large images.
+    if !(1..=256).contains(&sidelen) {
+        return Err(IoError::new(
+            ErrorKind::InvalidInput,
+            format!("resolution must be between 1 and 256, got {sidelen}"),
+        )
+        .into());
+    }
+    Ok(())
+}
+
+/// Convert the UI's resolution-independent structure value to the coordinate
+/// system used by the heuristic. Spatial distance is squared before it is
+/// weighted, so the weight must scale with the inverse square of resolution.
+pub(crate) fn normalized_proximity_importance(value: i64, sidelen: u32) -> i64 {
+    if value <= 0 || sidelen == 0 {
+        return 0;
+    }
+    let base = 128_i128;
+    let side = sidelen as i128;
+    let numerator = value as i128 * base * base;
+    let rounded = (numerator + side * side / 2) / (side * side);
+    rounded.clamp(1, i64::MAX as i128) as i64
 }
 
 #[derive(Clone, Copy, Serialize, Deserialize, PartialEq)]
@@ -170,18 +251,16 @@ impl GenerationSettings {
 
     pub(crate) fn get_raw_target(&self) -> SourceImg {
         if let Some((w, h, data)) = &self.custom_target {
-            image::ImageBuffer::from_vec(*w, *h, data.clone()).unwrap()
-        } else {
-            image::load_from_memory(include_bytes!("target256.png"))
-                .unwrap()
-                .to_rgb8()
+            if let Ok(image) = rgb_image_from_raw(*w, *h, data.clone()) {
+                return image;
+            }
         }
-    }
-
-    pub(crate) fn set_raw_target(&mut self, img: SourceImg) {
-        let (w, h) = img.dimensions();
-        let data = img.into_raw();
-        self.custom_target = Some((w, h, data));
+        // This image is compiled into the binary and covered by build/tests. If
+        // it ever becomes corrupt, return a valid one-pixel target rather than
+        // panicking during app startup.
+        image::load_from_memory(include_bytes!("target256.png"))
+            .map(|image| image.to_rgb8())
+            .unwrap_or_else(|_| SourceImg::from_pixel(1, 1, image::Rgb([0, 0, 0])))
     }
 
     pub fn clone_with_new_id(&self) -> Self {
@@ -212,4 +291,32 @@ pub fn load_weights(source: SourceImg) -> Vec<i64> {
         weights[(y * width + x) as usize] = weight;
     }
     weights
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn raw_image_decoder_accepts_rgb_and_rgba() {
+        let rgb = rgb_image_from_raw(1, 1, vec![10, 20, 30]).unwrap();
+        assert_eq!(rgb.get_pixel(0, 0).0, [10, 20, 30]);
+
+        let rgba = rgb_image_from_raw(1, 1, vec![40, 50, 60, 7]).unwrap();
+        assert_eq!(rgba.get_pixel(0, 0).0, [40, 50, 60]);
+    }
+
+    #[test]
+    fn raw_image_decoder_rejects_bad_lengths_and_dimensions() {
+        assert!(rgb_image_from_raw(0, 1, Vec::new()).is_err());
+        assert!(rgb_image_from_raw(2, 2, vec![0; 5]).is_err());
+    }
+
+    #[test]
+    fn proximity_weight_is_normalized_by_resolution_squared() {
+        assert_eq!(normalized_proximity_importance(13, 128), 13);
+        assert_eq!(normalized_proximity_importance(13, 64), 52);
+        assert_eq!(normalized_proximity_importance(13, 256), 3);
+        assert_eq!(normalized_proximity_importance(0, 64), 0);
+    }
 }

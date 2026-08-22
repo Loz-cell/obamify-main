@@ -2,19 +2,21 @@ use std::mem;
 
 use image::ImageBuffer;
 
-use crate::app::{SeedColor, SeedPos, preset::Preset};
+use crate::app::{SeedColor, SeedPos, calculate::util::rgb_image_from_raw, preset::Preset};
 
 #[cfg(not(target_arch = "wasm32"))]
 use crate::app::preset::UnprocessedPreset;
 
 // const DST_FORCE: f32 = 0.2;
 pub fn init_image(sidelen: u32, source: Preset) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
-    let imgpath = image::ImageBuffer::from_vec(
-        source.inner.width,
-        source.inner.height,
-        source.inner.source_img,
-    )
-    .unwrap();
+    let imgpath = square_image(
+        rgb_image_from_raw(
+            source.inner.width,
+            source.inner.height,
+            source.inner.source_img,
+        )
+        .unwrap_or_else(|_| image::RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 0]))),
+    );
     let assignments = source.assignments;
 
     let (seeds, colors, seeds_n) = init_colors(sidelen, imgpath);
@@ -33,10 +35,12 @@ pub fn init_canvas(
     sidelen: u32,
     source: UnprocessedPreset,
 ) -> (u32, Vec<SeedPos>, Vec<SeedColor>, Sim) {
-    use crate::app::calculate::drawing_process::DRAWING_CANVAS_SIZE;
-    let imgpath =
-        image::ImageBuffer::from_vec(source.width, source.height, source.source_img).unwrap();
-    let assignments = (0..(DRAWING_CANVAS_SIZE * DRAWING_CANVAS_SIZE)).collect::<Vec<usize>>();
+    let imgpath = square_image(
+        rgb_image_from_raw(source.width, source.height, source.source_img)
+            .unwrap_or_else(|_| image::RgbImage::from_pixel(1, 1, image::Rgb([0, 0, 0]))),
+    );
+    let assignments =
+        (0..imgpath.width() as usize * imgpath.height() as usize).collect::<Vec<usize>>();
 
     let (seeds, colors, seeds_n) = init_colors(sidelen, imgpath);
     let mut sim = Sim::new(source.name);
@@ -44,6 +48,17 @@ pub fn init_canvas(
 
     sim.set_assignments(assignments, sidelen);
     (seeds_n as u32, seeds, colors, sim)
+}
+
+fn square_image(source: image::RgbImage) -> image::RgbImage {
+    let (width, height) = source.dimensions();
+    if width == height {
+        return source;
+    }
+    let side = width.min(height).max(1);
+    let x = (width - side) / 2;
+    let y = (height - side) / 2;
+    image::imageops::crop_imm(&source, x, y, side, side).to_image()
 }
 
 fn init_colors(
@@ -56,12 +71,12 @@ fn init_colors(
     let width = source.width() as usize;
     let height = source.height() as usize;
 
-    assert_eq!(width, height);
+    debug_assert_eq!(width, height);
 
     let seeds_n = width * height;
     let pixelsize = sidelen as f32 / width as f32;
 
-    for y in 0..width {
+    for y in 0..height {
         for x in 0..width {
             let p = source.get_pixel(x as u32, y as u32);
             seeds.push(SeedPos {
@@ -179,11 +194,11 @@ impl CellBody {
         let dist = (dx * dx + dy * dy).sqrt();
         let personal_space = pixel_size * PERSONAL_SPACE;
 
-        let weight = (1.0 / dist) * (personal_space - dist) / personal_space;
-
         if dist > 0.0 && dist < personal_space {
+            let weight = (1.0 / dist) * (personal_space - dist) / personal_space;
             self.accx -= dx * weight;
             self.accy -= dy * weight;
+            weight
         } else if dist.abs() < f32::EPSILON {
             // if they are exactly on top of each other, push in a random direction
             let seed = (pos.xy[0].to_bits() as u64) ^ ((pos.xy[1].to_bits() as u64) << 32);
@@ -194,9 +209,10 @@ impl CellBody {
 
             self.accx += (r1 - 0.5) * 0.1;
             self.accy += (r2 - 0.5) * 0.1;
+            0.0
+        } else {
+            0.0
         }
-
-        weight.max(0.0)
     }
 
     fn apply_wall_force(&mut self, pos: &SeedPos, sidelen: f32, pixel_size: f32) {
@@ -226,6 +242,10 @@ pub struct Sim {
     pub cells: Vec<CellBody>,
     name: String,
     reversed: bool,
+    // Reused every frame. Keeping the buckets avoids thousands of small heap
+    // allocations during a transformation animation.
+    spatial_grid: Vec<Vec<usize>>,
+    assignment_seen: Vec<bool>,
 }
 
 impl Sim {
@@ -235,6 +255,8 @@ impl Sim {
             //elapsed_frames: 0,
             name,
             reversed: false,
+            spatial_grid: Vec::new(),
+            assignment_seen: Vec::new(),
         }
     }
 
@@ -256,11 +278,19 @@ impl Sim {
     }
 
     pub fn update(&mut self, positions: &mut [SeedPos], sidelen: u32) {
-        let grid_size = (self.cells.len() as f32).sqrt();
+        if self.cells.is_empty() || positions.len() != self.cells.len() || sidelen == 0 {
+            return;
+        }
+        let grid_side = (self.cells.len() as f32).sqrt().ceil() as usize;
+        let grid_size = grid_side as f32;
         let pixel_size = sidelen as f32 / grid_size;
         //dbg!(grid_size, pixel_size);
 
-        let mut grid = vec![vec![]; self.cells.len()];
+        let bucket_count = grid_side * grid_side;
+        self.spatial_grid.resize_with(bucket_count, Vec::new);
+        for bucket in &mut self.spatial_grid {
+            bucket.clear();
+        }
 
         for (i, p) in positions.iter().enumerate() {
             let x = p.xy[0] / pixel_size;
@@ -269,7 +299,7 @@ impl Sim {
             let index = (y.floor().clamp(0.0, grid_size - 1.0) * grid_size) as usize
                 + (x.floor().clamp(0.0, grid_size - 1.0) as usize);
             //
-            grid[index].push(i);
+            self.spatial_grid[index].push(i);
         }
 
         for (i, cell) in self.cells.iter_mut().enumerate() {
@@ -279,24 +309,24 @@ impl Sim {
 
         for i in 0..self.cells.len() {
             let pos = positions[i].xy;
-            let col = (pos[0] / pixel_size) as usize;
-            let row = (pos[1] / pixel_size) as usize;
+            let col = ((pos[0] / pixel_size).floor() as isize).clamp(0, grid_side as isize - 1);
+            let row = ((pos[1] / pixel_size).floor() as isize).clamp(0, grid_side as isize - 1);
             let mut avg_xvel = 0.0;
             let mut avg_yvel = 0.0;
             let mut count = 0.0;
-            for dy in 0..=2 {
-                for dx in 0..=2 {
-                    if col + dx == 0
-                        || row + dy == 0
-                        || col + dx >= grid_size as usize
-                        || row + dy >= grid_size as usize
+            for dy in -1..=1 {
+                for dx in -1..=1 {
+                    let ncol = col + dx;
+                    let nrow = row + dy;
+                    if ncol < 0
+                        || nrow < 0
+                        || ncol >= grid_side as isize
+                        || nrow >= grid_side as isize
                     {
                         continue;
                     }
-                    let ncol = col + dx - 1;
-                    let nrow = row + dy - 1;
-                    let nindex = nrow * (grid_size as usize) + ncol;
-                    for other in grid[nindex].iter() {
+                    let nindex = nrow as usize * grid_side + ncol as usize;
+                    for other in self.spatial_grid[nindex].iter() {
                         if other == &i {
                             continue;
                         }
@@ -307,8 +337,8 @@ impl Sim {
                             pixel_size,
                         );
 
-                        if self.cells[i].stroke_id == self.cells[*other].stroke_id
-                        // && self.cells[i].stroke_id != 0
+                        if self.cells[i].stroke_id != 0
+                            && self.cells[i].stroke_id == self.cells[*other].stroke_id
                         {
                             // stronger attraction to same stroke
                             self.cells[i].apply_stroke_attraction(positions[i], other_cell, weight);
@@ -336,17 +366,44 @@ impl Sim {
     }
 
     pub fn set_assignments(&mut self, assignments: Vec<usize>, sidelen: u32) {
-        let width = (self.cells.len() as f32).sqrt();
-        let pixelsize = sidelen as f32 / width;
+        if self.cells.is_empty() || sidelen == 0 {
+            return;
+        }
+        let width = (self.cells.len() as f32).sqrt() as usize;
+        if width * width != self.cells.len() {
+            return;
+        }
+        self.assignment_seen.resize(self.cells.len(), false);
+        self.assignment_seen.fill(false);
+        let mut valid = assignments.len() == self.cells.len();
+        if valid {
+            for &source in &assignments {
+                if source >= self.assignment_seen.len() || self.assignment_seen[source] {
+                    valid = false;
+                    break;
+                }
+                self.assignment_seen[source] = true;
+            }
+        }
+        let pixelsize = sidelen as f32 / width as f32;
 
-        for (dst_idx, src_idx) in assignments.iter().enumerate() {
-            let src_x = (src_idx % width as usize) as f32;
-            let src_y = (src_idx / width as usize) as f32;
-            let dst_x = (dst_idx % width as usize) as f32;
-            let dst_y = (dst_idx / width as usize) as f32;
-            let prev = self.cells[*src_idx];
+        for (dst_idx, assigned_src) in assignments
+            .iter()
+            .copied()
+            .chain(std::iter::repeat(0))
+            .take(self.cells.len())
+            .enumerate()
+        {
+            // Invalid or corrupted persisted assignments fall back to identity
+            // instead of indexing outside the cell array and panicking.
+            let src_idx = if valid { assigned_src } else { dst_idx };
+            let src_x = (src_idx % width) as f32;
+            let src_y = (src_idx / width) as f32;
+            let dst_x = (dst_idx % width) as f32;
+            let dst_y = (dst_idx / width) as f32;
+            let prev = self.cells[src_idx];
 
-            self.cells[*src_idx] = CellBody::new(
+            self.cells[src_idx] = CellBody::new(
                 (src_x + 0.5) * pixelsize,
                 (src_y + 0.5) * pixelsize,
                 (dst_x + 0.5) * pixelsize,
@@ -354,8 +411,8 @@ impl Sim {
                 prev.dst_force,
             );
 
-            self.cells[*src_idx].age = prev.age;
-            self.cells[*src_idx].stroke_id = prev.stroke_id;
+            self.cells[src_idx].age = prev.age;
+            self.cells[src_idx].stroke_id = prev.stroke_id;
         }
     }
 
@@ -373,6 +430,53 @@ impl Sim {
             }
             self.switch();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn four_cell_sim() -> Sim {
+        let mut sim = Sim::new("test".into());
+        sim.cells = vec![CellBody::new(0.0, 0.0, 0.0, 0.0, 0.1); 4];
+        sim
+    }
+
+    #[test]
+    fn invalid_assignments_fall_back_to_identity() {
+        let mut sim = four_cell_sim();
+        sim.set_assignments(vec![0, 0, 9], 4);
+
+        for (index, cell) in sim.cells.iter().enumerate() {
+            assert_eq!(cell.srcx, cell.dstx, "cell {index} x assignment");
+            assert_eq!(cell.srcy, cell.dsty, "cell {index} y assignment");
+        }
+    }
+
+    #[test]
+    fn overlapping_cells_do_not_produce_nan_or_infinity() {
+        let mut sim = four_cell_sim();
+        sim.set_assignments(vec![0, 1, 2, 3], 4);
+        let mut positions = vec![SeedPos { xy: [1.0, 1.0] }; 4];
+        sim.update(&mut positions, 4);
+        assert!(
+            positions
+                .iter()
+                .flat_map(|position| position.xy)
+                .all(f32::is_finite)
+        );
+    }
+
+    #[test]
+    fn spatial_grid_storage_is_reused_between_frames() {
+        let mut sim = four_cell_sim();
+        sim.set_assignments(vec![0, 1, 2, 3], 4);
+        let mut positions = vec![SeedPos { xy: [1.0, 1.0] }; 4];
+        sim.update(&mut positions, 4);
+        let grid_ptr = sim.spatial_grid.as_ptr();
+        sim.update(&mut positions, 4);
+        assert_eq!(grid_ptr, sim.spatial_grid.as_ptr());
     }
 }
 

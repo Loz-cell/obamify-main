@@ -14,8 +14,9 @@
         }
     ],
     "lang": "en",
-    "id": "/index.html",
-    "start_url": "./index.html",
+    "id": "./",
+    "start_url": "./",
+    "scope": "./",
     "display": "standalone",
     "background_color": "white",
     "theme_color": "white"
